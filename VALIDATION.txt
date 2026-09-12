@@ -1,0 +1,19 @@
+PASS  工程保存、重开与失败保护
+      png: 467 bytes
+PASS  PNG 编解码
+      png: 20976 / 25000 bytes，99×74，quality 1.000
+PASS  PNG 实际文件大小上限
+      jpeg: 939 bytes
+PASS  JPEG 编解码
+      jpeg: 7936 / 8000 bytes，205×154，quality 0.405
+PASS  JPEG 实际文件大小上限
+SKIP  HEIC 编码和压缩（显式跳过；未验证，不计为通过）
+PASS  无效图片和无法满足的压缩目标
+PASS  EXIF 方向、左上角裁剪与保留原图
+      PDF 文本：中⽂作业：第⼀章 / 保留可编辑⽂本与图⽚。 / 第⼆⻚：测试段落 / Hello PaperDesk 2026
+      注：系统字体的部分字形被映射为兼容部首；文本层不保证逐码位往返，固定版面不受影响。
+PASS  两页 A4 PDF、缩放独立、文本层与溢出保护
+PASS  DOCX 中文及图片往返
+PASS  Markdown 中文及本地图片资源往返
+
+52 项断言，0 个失败组。样例保留在开发时的 work/verification 目录（不随仓库交付）。

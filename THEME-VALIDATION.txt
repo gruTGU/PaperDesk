@@ -1,0 +1,6 @@
+2026-09-11 01:49:03.627 ui-tests[32099:14025909] Failure on line 688 in function id scheduleApplicationNotification(LSNotificationCode, NSWorkspaceNotificationCenter *): noErr == _LSModifyNotification(notificationID, 1, &code, 0, NULL, NULL, NULL)
+PASS readable light panels under NSAppearanceNameAqua: contrast=19.9:1
+PASS readable light panels under NSAppearanceNameDarkAqua: contrast=19.9:1
+root=(0.0, 0.0, 1320.0, 880.0) scroll=(0.0, 0.0, 914.0, 756.0) canvas=(0.0, 0.0, 914.0, 1803.77952756) inspector=(16.0, 20.0, 204.0, 653.0)
+ambiguous root=false inspector=false pageList=(0.0, 0.0, 142.0, 56.0)
+PASS internal controller editing, font change, delete, undo/redo, page operations, layout render

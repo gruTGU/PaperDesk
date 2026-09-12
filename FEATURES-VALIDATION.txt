@@ -1,0 +1,74 @@
+PaperDesk 0.2.0 — 2026-09-11
+测试范围：四边页边距、平移、多文档、另存为及存储管理。
+HEIC 明确跳过；不代表 HEIC 通过。
+
+
+核心自检
+PASS  工程保存、重开与失败保护
+PASS  四边页边距、旧工程兼容与失败保护
+      png: 467 bytes
+PASS  PNG 编解码
+      png: 20976 / 25000 bytes，99×74，quality 1.000
+PASS  PNG 实际文件大小上限
+      jpeg: 939 bytes
+PASS  JPEG 编解码
+      jpeg: 7936 / 8000 bytes，205×154，quality 0.405
+PASS  JPEG 实际文件大小上限
+SKIP  HEIC 编码和压缩（显式跳过；未验证，不计为通过）
+PASS  无效图片和无法满足的压缩目标
+PASS  EXIF 方向、左上角裁剪与保留原图
+      PDF 文本：中⽂作业：第⼀章 / 保留可编辑⽂本与图⽚。 / 第⼆⻚：测试段落 / Hello PaperDesk 2026
+      注：系统字体的部分字形被映射为兼容部首；文本层不保证逐码位往返，固定版面不受影响。
+PASS  两页 A4 PDF、视图和边距不改变固定版面、文本层与溢出保护
+PASS  DOCX 中文、图片与四边页边距往返
+PASS  Markdown 中文及本地图片资源往返
+
+73 项断言，0 个失败组。测试文件已清理。
+
+
+内部界面与生命周期
+2026-09-11 07:10:25.306 ui-tests[36110:14313623] Failure on line 688 in function id scheduleApplicationNotification(LSNotificationCode, NSWorkspaceNotificationCenter *): noErr == _LSModifyNotification(notificationID, 1, &code, 0, NULL, NULL, NULL)
+PASS readable light panels under NSAppearanceNameAqua: contrast=19.9:1
+PASS readable light panels under NSAppearanceNameDarkAqua: contrast=19.9:1
+PASS canvas horizontal panning, edge clamping, center-preserving zoom, hand/space drag, and decoded cache cleanup
+PASS independent documents, undo/recovery isolation, Save As original preservation, open/save conflict protection, four margin controls and minimum window layout
+root=(0.0, 0.0, 1320.0, 880.0) scroll=(0.0, 0.0, 914.0, 755.0) canvas=(0.0, 0.0, 1492.275590551, 1803.77952756) inspector=(16.0, 20.0, 204.0, 785.0)
+ambiguous root=false inspector=false pageList=(0.0, 0.0, 142.0, 56.0)
+PASS internal controller editing, font change, delete, undo/redo, page operations, layout render
+
+
+存储清理
+PASS disk bytes exclude linked files and avoid link cycles
+PASS new and legacy recoveries are listed
+PASS active recovery is labelled protected
+PASS user files and symbolic links excluded from recovery inventory
+PASS selection validated before any recovery deletion
+PASS arbitrary, traversal, and symbolic-link recovery paths rejected
+PASS arbitrary, traversal, and symbolic-link recovery paths rejected
+PASS arbitrary, traversal, and symbolic-link recovery paths rejected
+PASS arbitrary, traversal, and symbolic-link recovery paths rejected
+PASS only app cache files removed with accurate totals
+PASS saved user documents survive cache cleanup
+PASS cache cleanup preserves recovery backups
+PASS symbolic links preserved without following targets
+PASS selected stale recoveries removed once with accurate totals
+PASS active recovery and saved user project retained
+PASS cache directory symlink cannot expose user folder to cleanup
+PASS support directory symlink is rejected
+PASS missing application folders require no creation or cleanup
+PASS 18 storage checks; all data isolated in a temporary directory
+
+
+实际桌面操作检查（Computer Use）
+PASS 冷启动0.2.0，浅色控件显示正常。
+PASS Cmd+T 与标签栏 + 创建标签，Ctrl+Tab 切换，内容及四边距相互独立。
+PASS Cmd+Shift+N 创建独立窗口，Cmd+W 关闭后回到原标签组。
+PASS 未保存标签的关闭提示及取消，原文档继续保留。
+PASS 上10/下20/左25/右30 mm独立输入，新文字位置X25/Y10 mm；中文粘贴并保存。
+PASS 顶部“另存为”及Cmd+Shift+S打开原生保存面板，样例保存成功，JSON含独立边距与文字RTF。
+PASS 200%手型拖动使横向滚动位置由约0.500变为0.649，文字坐标未变；50%仍可横移。
+PASS 存储面板显示恢复备份为“使用中”；选中后删除按钮保持禁用。
+PASS Cmd+W关闭存储面板，不关闭背后的作业标签。
+PASS 最终窗口菜单不重复列出文档，新版重启后留在空白编辑界面。
+未对用户实际缓存执行删除；删除行为在独立临时目录测试。
+未使用强制退出验证完整桌面恢复；恢复文件隔离和保存保护已通过内部测试。
