@@ -8,7 +8,10 @@ xcrun swiftc -swift-version 5 -module-cache-path "$CACHE_DIR" \
   "$PROJECT_DIR/Sources/EditorController.swift" "$PROJECT_DIR/Sources/PDFExporter.swift" \
   "$PROJECT_DIR/Sources/ImageTools.swift" "$PROJECT_DIR/Sources/Conversion.swift" \
   "$PROJECT_DIR/Sources/ImageActions.swift" "$PROJECT_DIR/Sources/WorkspaceController.swift" \
+  "$PROJECT_DIR/Sources/AppAppearance.swift" \
   "$PROJECT_DIR/Sources/StorageManager.swift" "$PROJECT_DIR/Tests/EditorSmoke.swift" \
+  "$PROJECT_DIR/Sources/DocumentTasks.swift" \
   "$PROJECT_DIR/Tests/CanvasNavigationTests.swift" "$PROJECT_DIR/Tests/WorkspaceTests.swift" \
+  "$PROJECT_DIR/Tests/EditorReliabilityTests.swift" \
   -o "$PROJECT_DIR/build/ui-tests"
 "$PROJECT_DIR/build/ui-tests" "$PROJECT_DIR/work/ui-test"

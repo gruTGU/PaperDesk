@@ -56,10 +56,14 @@ extension EditorController {
         guard let item = canvas.selectedElement, item.kind == .image, let data = item.imageData else {
             showError(DeskError.message("请先选择一张图片。")); return
         }
+        runTask("正在准备裁剪", work: { try ImageTools.decodeThumbnail(data, maxPixelSize: 2048) }, completion: { [weak self] original in
+            self?.showCropPreview(original, item: item)
+        })
+    }
+    func showCropPreview(_ original: CGImage, item: PaperElement) {
         withError {
-            let original = try ImageTools.decode(data)
             let preview = CropPreviewView(image: original, crop: item.crop)
-            let alert = NSAlert(); alert.messageText = "裁剪图片"; alert.informativeText = "在原图上拖出保留的矩形区域。原图会保留，可随时重新裁剪。"
+            let alert = PaperDeskAppearance.alert(); alert.messageText = "裁剪图片"; alert.informativeText = "在原图上拖出保留的矩形区域。原图会保留，可随时重新裁剪。"
             alert.accessoryView = preview; alert.addButton(withTitle: "应用裁剪"); alert.addButton(withTitle: "取消"); alert.addButton(withTitle: "恢复完整图片")
             let result = alert.runModal()
             guard result != .alertSecondButtonReturn else { return }
@@ -87,7 +91,7 @@ extension EditorController {
         columns.widthAnchor.constraint(equalToConstant: 150).isActive = true
         gap.widthAnchor.constraint(equalToConstant: 150).isActive = true
         stack.setFrameSize(CGSize(width: 320, height: 120))
-        let alert = NSAlert(); alert.messageText = "排列 \(images.count) 张图片"; alert.informativeText = "在当前页的上下左右页边距以内等比排列。已有文字保留原位，可用撤销恢复。"; alert.accessoryView = stack; alert.addButton(withTitle: "排列"); alert.addButton(withTitle: "取消")
+        let alert = PaperDeskAppearance.alert(); alert.messageText = "排列 \(images.count) 张图片"; alert.informativeText = "在当前页的上下左右页边距以内等比排列。已有文字保留原位，可用撤销恢复。"; alert.accessoryView = stack; alert.addButton(withTitle: "排列"); alert.addButton(withTitle: "取消")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         guard let gapMM = Double(gap.stringValue), gapMM.isFinite, (0...30).contains(gapMM) else { showError(DeskError.message("图片间距请输入 0～30 mm。")); return }
         let count = min(images.count, columns.indexOfSelectedItem + 1)
@@ -110,14 +114,17 @@ extension EditorController {
     @objc func exportSelectedImage() {
         canvas.finishEditing()
         guard let item = canvas.selectedElement, item.kind == .image else { showError(DeskError.message("请先选择一张图片，再另存或压缩。")); return }
-        withError {
-            let image = try ImageTools.displayedImage(for: item)
-            presentImageExport(image, suggestedName: (item.imageName as NSString?)?.deletingPathExtension ?? "图片")
-        }
+        runTask("正在准备图片", work: { try ImageTools.displayedImage(for: item) }, completion: { [weak self] image in
+            self?.presentImageExport(image, suggestedName: (item.imageName as NSString?)?.deletingPathExtension ?? "图片")
+        })
     }
     @objc func exportPageImage() {
         canvas.finishEditing()
-        withError { presentImageExport(try PDFExporter.pageImage(canvas.document.pages[canvas.activePage], scale: 2), suggestedName: canvas.document.title + "-第\(canvas.activePage + 1)页") }
+        let page = canvas.document.pages[canvas.activePage]
+        let name = canvas.document.title + "-第\(canvas.activePage + 1)页"
+        runTask("正在生成页面图片", work: { try PDFExporter.pageImage(page, scale: 2) }, completion: { [weak self] image in
+            self?.presentImageExport(image, suggestedName: name)
+        })
     }
     func presentImageExport(_ image: CGImage, suggestedName: String) {
         guard !exporting else { showError(DeskError.message("正在处理上一张图片，请稍候。")); return }
@@ -129,7 +136,7 @@ extension EditorController {
         formatPicker.widthAnchor.constraint(equalToConstant: 320).isActive = true
         limit.widthAnchor.constraint(equalToConstant: 320).isActive = true
         stack.setFrameSize(CGSize(width: 360, height: 120))
-        let alert = NSAlert(); alert.messageText = "图片另存 / 压缩"
+        let alert = PaperDeskAppearance.alert(); alert.messageText = "图片另存 / 压缩"
         alert.informativeText = "当前 \(image.width) × \(image.height) 像素。\n为满足上限可能降低质量或像素尺寸。PNG 保留透明，JPEG / HEIC 使用白色底。"; alert.accessoryView = stack; alert.addButton(withTitle: "选择保存位置"); alert.addButton(withTitle: "取消")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         guard let kb = Double(limit.stringValue), kb.isFinite, kb >= 0, kb <= 200000 else { showError(DeskError.message("大小上限请输入 0～200000 KB。")); return }
@@ -137,22 +144,12 @@ extension EditorController {
         let format = ImageFormat.allCases[formatPicker.indexOfSelectedItem]
         let panel = NSSavePanel(); panel.allowedContentTypes = [UTType(filenameExtension: format.fileExtension) ?? .image]; panel.nameFieldStringValue = suggestedName + "." + format.fileExtension
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        exporting = true
-        statusLabel.stringValue = "正在处理图片…"
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let result: Result<ImageExportResult, Error> = Result {
-                let exported = try ImageTools.export(image, format: format, maxBytes: maxBytes)
-                try exported.data.write(to: url, options: .atomic)
-                return exported
-            }
-            DispatchQueue.main.async {
-                guard let self else { return }; self.exporting = false
-                switch result {
-                case .success(let output):
-                    self.statusLabel.stringValue = String(format: "已保存：%.1f KB · %d × %d 像素%@", Double(output.data.count) / 1000, output.width, output.height, output.resized ? " · 已降低像素尺寸" : "")
-                case .failure(let error): self.statusLabel.stringValue = "图片导出失败"; self.showError(error)
-                }
-            }
-        }
+        runTask("正在压缩并保存图片", work: { () throws -> ImageExportResult in
+            let exported = try ImageTools.export(image, format: format, maxBytes: maxBytes)
+            try exported.data.write(to: url, options: .atomic)
+            return exported
+        }, completion: { [weak self] output in
+            self?.statusLabel.stringValue = String(format: "已保存：%.1f KB · %d × %d 像素%@", Double(output.data.count) / 1000, output.width, output.height, output.resized ? " · 已降低像素尺寸" : "")
+        })
     }
 }

@@ -14,8 +14,30 @@ struct CanvasViewportAnchor {
     let pointOnPage: CGPoint
 }
 
+/// A cancelled request can finish in ImageIO, but must never replace newer canvas state.
+private final class CanvasPreviewRequest {
+    let generation: UInt64
+    let element: PaperElement
+    let maximumDimension: Int
+    private let lock = NSLock()
+    private var cancelled = false
+    init(generation: UInt64, element: PaperElement, maximumDimension: Int) {
+        self.generation = generation; self.element = element; self.maximumDimension = maximumDimension
+    }
+    func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+    func matches(_ item: PaperElement) -> Bool { element.imageData == item.imageData && element.crop == item.crop }
+}
+
 final class CanvasView: NSView, NSTextViewDelegate {
     var document = PaperDocument()
+    var isInteractionEnabled = true {
+        didSet {
+            guard !isInteractionEnabled else { return }
+            finishEditing()
+            cancelObjectDrag()
+        }
+    }
     var selectedIDs = Set<UUID>()
     var activePage = 0
     var onWillChange: (() -> Void)?
@@ -32,6 +54,20 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
     private var imageCache: [UUID: NSImage] = [:]
     private var imageCacheSizes: [UUID: Int] = [:]
+    private var cachedImageSources: [UUID: PaperElement] = [:]
+    private var failedImageSources: [UUID: PaperElement] = [:]
+    private var pendingPreviews: [UUID: CanvasPreviewRequest] = [:]
+    private var previewGeneration: UInt64 = 0
+    private static let previewQueue = DispatchQueue(label: "PaperDesk.canvas-preview", qos: .userInitiated)
+    static let imageCacheBudget = 64 * 1024 * 1024
+    private struct OverflowResult {
+        let rtf: Data?
+        let size: CGSize
+        let value: Bool
+    }
+    private var overflowResults: [UUID: OverflowResult] = [:]
+    var pendingPreviewCount: Int { pendingPreviews.count }
+    var failedPreviewCount: Int { failedImageSources.count }
     var cachedImageCount: Int { imageCache.count }
     /// Decoded pixel buffer sizes; the small NSImage/object overhead is excluded.
     var cachedImageBytes: Int { imageCacheSizes.values.reduce(0, +) }
@@ -41,6 +77,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private var dragStart = CGPoint.zero
     private var dragElements: [PaperElement] = []
     private var dragSourcePage = 0
+    private var dragSourcePageID: UUID?
     private var dragResize = false
     private var didDrag = false
     private var startingRect = CGRect.zero
@@ -52,6 +89,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         registerForDraggedTypes([.fileURL])
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) unavailable") }
+    deinit { pendingPreviews.values.forEach { $0.cancel() } }
     var zoom: CGFloat { document.zoom }
     var selectedElement: PaperElement? {
         guard selectedIDs.count == 1 else { return nil }
@@ -128,18 +166,95 @@ final class CanvasView: NSView, NSTextViewDelegate {
         }
         super.scrollWheel(with: event)
     }
-    func clearImageCache() { imageCache.removeAll(); imageCacheSizes.removeAll() }
+    func clearImageCache() {
+        previewGeneration &+= 1
+        pendingPreviews.values.forEach { $0.cancel() }
+        pendingPreviews.removeAll()
+        imageCache.removeAll(); imageCacheSizes.removeAll(); cachedImageSources.removeAll(); failedImageSources.removeAll()
+    }
     func invalidateImages() { clearImageCache(); needsDisplay = true }
-    func rebuildImages() {
+    private func sameImage(_ first: PaperElement, _ second: PaperElement) -> Bool {
+        first.imageData == second.imageData && first.crop == second.crop
+    }
+    private func visibleImages() -> [UUID: PaperElement] {
         let displayedRect = enclosingScrollView == nil ? bounds : visibleRect
+        var wanted: [UUID: PaperElement] = [:]
         for (index, page) in document.pages.enumerated() where pageRect(index).intersects(displayedRect) {
-            for item in page.elements where item.kind == .image && imageCache[item.id] == nil {
-                if let cg = try? ImageTools.displayedImage(for: item) {
-                    imageCache[item.id] = NSImage(cgImage: cg, size: .zero)
-                    imageCacheSizes[item.id] = cg.bytesPerRow * cg.height
+            let pageFrame = pageRect(index)
+            for item in page.elements where item.kind == .image {
+                let frame = CGRect(x: pageFrame.minX + item.x * zoom, y: pageFrame.minY + item.y * zoom,
+                                   width: item.width * zoom, height: item.height * zoom)
+                if frame.intersects(displayedRect.intersection(pageFrame)) { wanted[item.id] = item }
+            }
+        }
+        return wanted
+    }
+    /// Decode only visible image objects, off the event thread, using a bounded thumbnail.
+    func rebuildImages() {
+        let wanted = visibleImages()
+        // Leave a little space for bitmap row alignment. Rebalance if a new collage appears.
+        let itemBudget = Int(Double(Self.imageCacheBudget) * 0.9 / Double(max(1, wanted.count)))
+        let maximumDimension = min(2048, max(1, Int(sqrt(Double(itemBudget) / 4))))
+        for id in Array(imageCache.keys) {
+            if let item = wanted[id], let source = cachedImageSources[id], sameImage(item, source), (imageCacheSizes[id] ?? 0) <= itemBudget { continue }
+            imageCache.removeValue(forKey: id); imageCacheSizes.removeValue(forKey: id); cachedImageSources.removeValue(forKey: id)
+        }
+        for (id, request) in pendingPreviews {
+            if let item = wanted[id], request.matches(item), request.maximumDimension <= maximumDimension { continue }
+            request.cancel(); pendingPreviews.removeValue(forKey: id)
+        }
+        // Share the pixel budget among visible objects, so a collage cannot thrash the cache.
+        for item in wanted.values {
+            if imageCache[item.id] != nil || pendingPreviews[item.id] != nil { continue }
+            if let failed = failedImageSources[item.id], sameImage(failed, item) { continue }
+            let request = CanvasPreviewRequest(generation: previewGeneration, element: item, maximumDimension: maximumDimension)
+            pendingPreviews[item.id] = request
+            Self.previewQueue.async { [weak self] in
+                guard !request.isCancelled else { return }
+                let result = Result { try ImageTools.preview(for: request.element, maxPixelSize: request.maximumDimension) }
+                guard !request.isCancelled else { return }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.previewGeneration == request.generation,
+                          self.pendingPreviews[item.id] === request, !request.isCancelled else { return }
+                    self.pendingPreviews.removeValue(forKey: item.id)
+                    guard let visible = self.visibleImages()[item.id], request.matches(visible) else { return }
+                    switch result {
+                    case .success(let cg):
+                        let bytes = cg.bytesPerRow * cg.height
+                        if bytes <= Self.imageCacheBudget - self.cachedImageBytes {
+                            self.imageCache[item.id] = NSImage(cgImage: cg, size: .zero)
+                            self.imageCacheSizes[item.id] = bytes
+                            self.cachedImageSources[item.id] = request.element
+                            self.failedImageSources.removeValue(forKey: item.id)
+                        } else {
+                            // Avoid repeatedly decoding a request rejected by the current budget.
+                            self.failedImageSources[item.id] = request.element
+                        }
+                    case .failure:
+                        self.failedImageSources[item.id] = request.element
+                    }
+                    self.needsDisplay = true
                 }
             }
         }
+        // Failed resources are cheap placeholders, but should not retain deleted project data.
+        let liveIDs = Set(document.pages.flatMap(\.elements).filter { $0.kind == .image }.map(\.id))
+        failedImageSources = failedImageSources.filter { liveIDs.contains($0.key) }
+    }
+    func overflows(_ item: PaperElement) -> Bool {
+        guard item.kind == .text else { return false }
+        let size = CGSize(width: item.width, height: item.height)
+        if let cached = overflowResults[item.id], cached.rtf == item.textRTF, cached.size == size { return cached.value }
+        let valid = item.width.isFinite && item.height.isFinite && item.width > 0 && item.height > 0
+        let value = valid ? PageDrawing.overflows(item) : true
+        overflowResults[item.id] = OverflowResult(rtf: item.textRTF, size: size, value: value)
+        return value
+    }
+    var overflowCount: Int {
+        let texts = document.pages.flatMap(\.elements).filter { $0.kind == .text }
+        let ids = Set(texts.map(\.id))
+        overflowResults = overflowResults.filter { ids.contains($0.key) }
+        return texts.reduce(0) { $0 + (overflows($1) ? 1 : 0) }
     }
     override func draw(_ dirtyRect: NSRect) {
         NSColor(calibratedRed: 0.91, green: 0.93, blue: 0.95, alpha: 1).setFill(); dirtyRect.fill()
@@ -155,14 +270,22 @@ final class CanvasView: NSView, NSTextViewDelegate {
             let transform = AffineTransform(translationByX: rect.minX, byY: rect.minY)
             (transform as NSAffineTransform).concat()
             NSAffineTransform.scale(by: zoom)
-            PageDrawing.draw(page, skipText: editingID, imageCache: imageCache)
+            PageDrawing.draw(page, skipText: editingID, imageCache: imageCache, allowImageDecoding: false)
+            if page.elements.isEmpty {
+                let hint = NSAttributedString(string: "双击添加文字\n拖入图片开始排版", attributes: [
+                    .font: NSFont.systemFont(ofSize: 13),
+                    .foregroundColor: NSColor(srgbRed: 0.57, green: 0.63, blue: 0.68, alpha: 1),
+                    .paragraphStyle: { let style = NSMutableParagraphStyle(); style.alignment = .center; style.lineSpacing = 8; return style }()
+                ])
+                hint.draw(in: CGRect(x: 60, y: paperHeight / 2 - 24, width: paperWidth - 120, height: 60))
+            }
             if showMargins {
                 let guide = NSBezierPath(rect: document.contentRect)
                 guide.lineWidth = 0.5 / zoom
                 guide.setLineDash([3 / zoom, 4 / zoom], count: 2, phase: 0)
                 NSColor(calibratedWhite: 0.75, alpha: 0.55).setStroke(); guide.stroke()
             }
-            for item in page.elements where item.kind == .text && PageDrawing.overflows(item) {
+            for item in page.elements where item.kind == .text && overflows(item) {
                 NSColor.systemRed.setStroke()
                 let outline = NSBezierPath(rect: item.rect); outline.lineWidth = 1.5 / zoom; outline.stroke()
             }
@@ -183,10 +306,12 @@ final class CanvasView: NSView, NSTextViewDelegate {
         if isPanActive {
             window?.makeFirstResponder(self)
             panDragLocation = event.locationInWindow
-            dragElements = []; didDrag = false
+            cancelObjectDrag()
             updatePanCursor()
             return
         }
+        guard isInteractionEnabled else { return }
+        cancelObjectDrag()
         finishEditing()
         window?.makeFirstResponder(self)
         let point = convert(event.locationInWindow, from: nil)
@@ -203,6 +328,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             if event.clickCount == 2 && hit.kind == .text { selectedIDs = [hit.id]; startEditing(hit.id); return }
             dragStart = point
             dragSourcePage = page
+            dragSourcePageID = document.pages[page].id
             dragResize = handleHit != nil && selectedIDs.count == 1
             startingRect = hit.rect
             dragElements = elements.filter { selectedIDs.contains($0.id) }
@@ -221,8 +347,9 @@ final class CanvasView: NSView, NSTextViewDelegate {
             panViewport(by: CGPoint(x: previous.x - point.x, y: point.y - previous.y))
             return
         }
-        guard !dragElements.isEmpty else { return }
+        guard isInteractionEnabled, hasValidObjectDrag else { cancelObjectDrag(); return }
         if !didDrag { onWillChange?(); didDrag = true }
+        guard hasValidObjectDrag else { cancelObjectDrag(); return }
         let point = convert(event.locationInWindow, from: nil)
         let dx = (point.x - dragStart.x) / zoom
         let dy = (point.y - dragStart.y) / zoom
@@ -253,7 +380,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             updatePanCursor()
             return
         }
-        guard didDrag else { return }
+        guard isInteractionEnabled, didDrag, hasValidObjectDrag else { cancelObjectDrag(); return }
         let point = convert(event.locationInWindow, from: nil)
         let targetPage = pageIndex(at: point) ?? dragSourcePage
         if !dragResize && targetPage != dragSourcePage {
@@ -273,8 +400,16 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 document.pages[dragSourcePage].elements[index].rect = clamped(document.pages[dragSourcePage].elements[index].rect)
             }
         }
-        dragElements = []; didDrag = false
+        cancelObjectDrag()
         onChange?(); onSelection?(); needsDisplay = true
+    }
+    private var hasValidObjectDrag: Bool {
+        !dragElements.isEmpty && document.pages.indices.contains(dragSourcePage)
+            && document.pages[dragSourcePage].id == dragSourcePageID
+            && dragElements.allSatisfy { original in selectedIDs.contains(original.id) && document.pages[dragSourcePage].elements.contains { $0.id == original.id } }
+    }
+    private func cancelObjectDrag() {
+        dragElements = []; didDrag = false; dragSourcePageID = nil
     }
     func clamped(_ rect: CGRect) -> CGRect {
         CGRect(x: max(0, min(paperWidth - rect.width, rect.minX)), y: max(0, min(paperHeight - rect.height, rect.minY)), width: rect.width, height: rect.height)
@@ -285,7 +420,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
             updatePanCursor()
             return
         }
-        if event.keyCode == 51 || event.keyCode == 117 { onDelete?(); return }
+        guard isInteractionEnabled else { return }
+        if event.keyCode == 51 || event.keyCode == 117 { cancelObjectDrag(); onDelete?(); return }
         if event.keyCode == 53 { selectedIDs = []; onSelection?(); needsDisplay = true; return }
         let steps: [UInt16: CGPoint] = [123: CGPoint(x: -1, y: 0), 124: CGPoint(x: 1, y: 0), 125: CGPoint(x: 0, y: 1), 126: CGPoint(x: 0, y: -1)]
         if let direction = steps[event.keyCode], !selectedIDs.isEmpty {
@@ -312,6 +448,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
 
     func startEditing(_ id: UUID) {
+        guard isInteractionEnabled else { return }
+        cancelObjectDrag()
         finishEditing()
         guard let item = document.pages.flatMap(\.elements).first(where: { $0.id == id && $0.kind == .text }) else { return }
         onWillChange?()
@@ -371,8 +509,13 @@ final class CanvasView: NSView, NSTextViewDelegate {
     func finishEditing() {
         guard textEditor != nil else { return }
         syncEditing()
-        textEditor?.delegate = nil
-        textEditor?.removeFromSuperview()
+        let editor = textEditor
+        editor?.delegate = nil
+        editor?.onFinish = nil
+        // AppKit may ask its first responder to close an undo group during a focus change.
+        // Keep the text view alive until that change has completed.
+        if window?.firstResponder === editor { window?.makeFirstResponder(self) }
+        editor?.removeFromSuperview()
         textEditor = nil; editingID = nil
         onChange?(); needsDisplay = true
     }
@@ -380,9 +523,10 @@ final class CanvasView: NSView, NSTextViewDelegate {
         syncEditing(); onChange?(); needsDisplay = true
     }
 
-    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { .copy }
-    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { true }
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { isInteractionEnabled ? .copy : [] }
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool { isInteractionEnabled }
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard isInteractionEnabled else { return false }
         let urls = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
         guard !urls.isEmpty else { return false }
         let point = convert(sender.draggingLocation, from: nil)

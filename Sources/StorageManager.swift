@@ -162,6 +162,8 @@ final class StorageWindowController: NSWindowController, NSTableViewDataSource, 
     private let memoryCacheUsage: () -> (count: Int, bytes: Int64)
     private let clearMemoryCache: () -> Void
     private let locations: StorageLocations
+    private let canDeleteRecoveries: () -> Bool
+    private(set) var deletingRecoveries = false
     private let table = NSTableView()
     private let summary = NSTextField(labelWithString: "正在读取…")
     private let feedback = NSTextField(wrappingLabelWithString: "")
@@ -170,11 +172,12 @@ final class StorageWindowController: NSWindowController, NSTableViewDataSource, 
     private var deleteButton: NSButton!
     private var busy = false
 
-    init(activeRecoveryURLs: @escaping () -> Set<URL>, memoryCacheUsage: @escaping () -> (count: Int, bytes: Int64), clearMemoryCache: @escaping () -> Void, locations: StorageLocations = .user) {
+    init(activeRecoveryURLs: @escaping () -> Set<URL>, memoryCacheUsage: @escaping () -> (count: Int, bytes: Int64), clearMemoryCache: @escaping () -> Void, locations: StorageLocations = .user, canDeleteRecoveries: @escaping () -> Bool = { true }) {
         self.activeRecoveryURLs = activeRecoveryURLs
         self.memoryCacheUsage = memoryCacheUsage
         self.clearMemoryCache = clearMemoryCache
         self.locations = locations
+        self.canDeleteRecoveries = canDeleteRecoveries
         let panel = NSPanel(contentRect: CGRect(x: 0, y: 0, width: 900, height: 530), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         super.init(window: panel)
         panel.title = "存储与缓存 · PaperDesk"
@@ -307,6 +310,7 @@ final class StorageWindowController: NSWindowController, NSTableViewDataSource, 
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.setBusy(false)
+                self.deletingRecoveries = false
                 switch result {
                 case .success(let cleaned):
                     self.feedback.stringValue = "已清理 \(cleaned.filesRemoved) 个文件，释放 \(Self.size(cleaned.bytesRemoved))。" + (cleaned.skipped > 0 ? "已跳过 \(cleaned.skipped) 个链接或特殊文件。" : "")
@@ -325,14 +329,19 @@ final class StorageWindowController: NSWindowController, NSTableViewDataSource, 
     @objc private func deleteSelected() {
         let selected = selectedRecoveries
         guard !selected.isEmpty, let window else { return }
-        let alert = NSAlert()
+        let alert = PaperDeskAppearance.alert()
         alert.messageText = "删除 \(selected.count) 个恢复备份？"
         alert.informativeText = "这些备份可能包含尚未另存的作业。删除后无法通过 PaperDesk 恢复。\n\n" + selected.prefix(4).map(\.lastPathComponent).joined(separator: "\n")
         alert.alertStyle = .warning
         alert.addButton(withTitle: "取消"); alert.addButton(withTitle: "删除备份")
         alert.beginSheetModal(for: window) { [weak self] response in
             guard response == .alertSecondButtonReturn, let self else { return }
+            guard !self.busy, self.canDeleteRecoveries() else {
+                self.feedback.stringValue = "文档正在读取或保存，请任务完成后再删除恢复备份。"
+                return
+            }
             let active = self.activeRecoveryURLs(), places = self.locations
+            self.deletingRecoveries = true
             self.runCleanup { try StorageManager.deleteRecoveries(selected, activeRecoveryURLs: active, locations: places) }
         }
     }

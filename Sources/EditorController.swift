@@ -9,7 +9,7 @@ final class EditorWindow: NSWindow {
     override func newWindowForTab(_ sender: Any?) { editor?.newDocument() }
 }
 
-final class EditorController: NSObject, NSWindowDelegate {
+final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
     let window: NSWindow
     let canvas = CanvasView(frame: .zero)
     let scroll = NSScrollView()
@@ -34,6 +34,7 @@ final class EditorController: NSObject, NSWindowDelegate {
     var geometry: [NSTextField] = []
     let ratioCheck = NSButton(checkboxWithTitle: "图片保持比例", target: nil, action: nil)
     var currentURL: URL?
+    var pendingSaveURL: URL?
     var dirty = false
     var savedDocument = PaperDocument()
     var undoStack: [PaperDocument] = []
@@ -42,6 +43,15 @@ final class EditorController: NSObject, NSWindowDelegate {
     var restorationURL: URL
     var pageSignature = ""
     var exporting = false
+    var taskName: String?
+    let taskIndicator = NSProgressIndicator()
+    let recoveryQueue = DispatchQueue(label: "local.paperdesk.recovery", qos: .utility)
+    var recoveryPending = false
+    var recoveryGeneration = 0
+    var lastRecoveryDocument: PaperDocument?
+    var isClosed = false
+    var contextualButtons: [NSButton] = []
+    var textControls: [NSControl] = []
 
     init(restorationURL: URL = StorageManager.recoveryDirectory.appendingPathComponent("Recovery-\(UUID().uuidString).paperdesk")) {
         window = EditorWindow(contentRect: CGRect(x: 0, y: 0, width: 1320, height: 880), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
@@ -60,6 +70,7 @@ final class EditorController: NSObject, NSWindowDelegate {
         savedDocument = canvas.document
         autosaveTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.writeRecovery() }
     }
+    deinit { autosaveTimer?.invalidate() }
     func show(center: Bool = true) {
         if center { window.center() }
         window.makeKeyAndOrderFront(nil)
@@ -76,7 +87,10 @@ final class EditorController: NSObject, NSWindowDelegate {
         let button = NSButton(title: title, target: self, action: action)
         button.bezelStyle = .rounded
         button.controlSize = .regular
+        button.font = .systemFont(ofSize: 12, weight: .medium)
         if let symbol { button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title); button.imagePosition = .imageLeading }
+        button.toolTip = title
+        if [#selector(cropImage), #selector(exportSelectedImage), #selector(bringFront), #selector(sendBack), #selector(deleteSelection)].contains(action) { contextualButtons.append(button) }
         return button
     }
     private func row(_ views: [NSView], spacing: CGFloat = 8) -> NSStackView {
@@ -113,7 +127,15 @@ final class EditorController: NSObject, NSWindowDelegate {
         titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let pdf = button("导出 PDF", #selector(exportPDF), symbol: "arrow.up.document.fill")
         pdf.bezelColor = .controlAccentColor
-        let header = row([label("▧  PaperDesk", size: 20, weight: .bold), label("｜", size: 20), titleLabel, spacer(), button("新标签", #selector(newDocument), symbol: "plus"), button("打开", #selector(openDocument), symbol: "folder"), button("保存", #selector(saveDocument), symbol: "square.and.arrow.down"), button("另存为", #selector(saveAs), symbol: "doc.on.doc"), pdf], spacing: 10)
+        let brandIcon = NSImageView()
+        brandIcon.image = PaperDeskAppearance.applicationIcon()
+        brandIcon.imageScaling = .scaleProportionallyUpOrDown
+        brandIcon.widthAnchor.constraint(equalToConstant: 36).isActive = true
+        brandIcon.heightAnchor.constraint(equalToConstant: 36).isActive = true
+        brandIcon.setAccessibilityLabel("PaperDesk 应用图标")
+        let brand = NSStackView(views: [label("PaperDesk", size: 18, weight: .bold), label("你的 A4 图文工作台", size: 10)])
+        brand.orientation = .vertical; brand.alignment = .leading; brand.spacing = 1
+        let header = row([brandIcon, brand, label("｜", size: 20), titleLabel, spacer(), button("新标签", #selector(newDocument), symbol: "plus"), button("打开", #selector(openDocument), symbol: "folder"), button("保存", #selector(saveDocument), symbol: "square.and.arrow.down"), button("另存为", #selector(saveAs), symbol: "doc.on.doc"), pdf], spacing: 10)
         header.edgeInsets = NSEdgeInsets(top: 14, left: 18, bottom: 14, right: 18)
         outer.addArrangedSubview(header); header.widthAnchor.constraint(equalTo: outer.widthAnchor).isActive = true
         let topDivider = divider(); outer.addArrangedSubview(topDivider); topDivider.widthAnchor.constraint(equalTo: outer.widthAnchor).isActive = true
@@ -124,6 +146,7 @@ final class EditorController: NSObject, NSWindowDelegate {
         body.setContentHuggingPriority(.defaultLow, for: .vertical)
 
         let sidebar = NSStackView(); sidebar.orientation = .vertical; sidebar.alignment = .leading; sidebar.spacing = 12
+        sidebar.wantsLayer = true; sidebar.layer?.backgroundColor = NSColor.white.cgColor
         sidebar.edgeInsets = NSEdgeInsets(top: 20, left: 14, bottom: 16, right: 14)
         sidebar.addArrangedSubview(label("页面", size: 13, weight: .semibold))
         sidebar.addArrangedSubview(button("添加 A4 页", #selector(addPage), symbol: "plus.rectangle"))
@@ -167,12 +190,13 @@ final class EditorController: NSObject, NSWindowDelegate {
         inspector.orientation = .vertical; inspector.alignment = .leading; inspector.spacing = 11
         inspector.translatesAutoresizingMaskIntoConstraints = false
         let inspectContainer = TopAlignedView(); inspectContainer.translatesAutoresizingMaskIntoConstraints = false
+        inspectContainer.wantsLayer = true; inspectContainer.layer?.backgroundColor = NSColor.white.cgColor
         inspectContainer.addSubview(inspector); inspectScroll.documentView = inspectContainer
         NSLayoutConstraint.activate([inspectContainer.widthAnchor.constraint(equalTo: inspectScroll.contentView.widthAnchor), inspector.leadingAnchor.constraint(equalTo: inspectContainer.leadingAnchor, constant: 16), inspector.trailingAnchor.constraint(equalTo: inspectContainer.trailingAnchor, constant: -16), inspector.topAnchor.constraint(equalTo: inspectContainer.topAnchor, constant: 20), inspector.bottomAnchor.constraint(equalTo: inspectContainer.bottomAnchor, constant: -20)])
         body.addArrangedSubview(inspectScroll)
         inspectScroll.widthAnchor.constraint(equalToConstant: 236).isActive = true
         inspectScroll.heightAnchor.constraint(equalTo: body.heightAnchor).isActive = true
-        addInspector(label("属性", size: 13, weight: .semibold))
+        addInspector(label("对象属性", size: 14, weight: .semibold))
         selectionLabel.font = .systemFont(ofSize: 11); selectionLabel.textColor = .secondaryLabelColor
         addInspector(selectionLabel)
         addInspector(divider())
@@ -182,6 +206,8 @@ final class EditorController: NSObject, NSWindowDelegate {
             for name in pair {
                 let input = NSTextField(string: "0"); input.target = self; input.action = #selector(applyGeometry)
                 input.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+                input.setAccessibilityLabel("对象\(name)（毫米）")
+                input.toolTip = "对象\(name)，单位为毫米；按 Return 应用"
                 input.widthAnchor.constraint(equalToConstant: 62).isActive = true
                 geometry.append(input); parts += [label(name, size: 11), input]
             }
@@ -200,6 +226,9 @@ final class EditorController: NSObject, NSWindowDelegate {
         fontSizeField.widthAnchor.constraint(equalToConstant: 58).isActive = true
         let bold = button("B", #selector(toggleBold)); bold.font = .boldSystemFont(ofSize: 13)
         let italic = button("I", #selector(toggleItalic)); let underline = button("U", #selector(toggleUnderline))
+        bold.toolTip = "加粗"; italic.toolTip = "斜体"; underline.toolTip = "下划线"
+        fontSizeField.setAccessibilityLabel("字号（点）")
+        fontSizeField.toolTip = "字号 4～200 pt；按 Return 应用"
         addInspector(row([fontSizeField, label("pt", size: 10), bold, italic, underline], spacing: 3))
         alignment.target = self; alignment.action = #selector(applyAlignment); alignment.selectedSegment = 0
         addInspector(alignment)
@@ -207,6 +236,7 @@ final class EditorController: NSObject, NSWindowDelegate {
         linePicker.target = self; linePicker.action = #selector(applyLineHeight)
         colorWell.color = .black; colorWell.target = self; colorWell.action = #selector(applyColor)
         colorWell.widthAnchor.constraint(equalToConstant: 42).isActive = true
+        textControls = [fontPicker, fontSizeField, bold, italic, underline, alignment, linePicker, colorWell]
         addInspector(row([label("行距", size: 11), linePicker, spacer(), colorWell]))
         addInspector(divider())
         gapSlider.target = self; gapSlider.action = #selector(changeGap)
@@ -238,7 +268,15 @@ final class EditorController: NSObject, NSWindowDelegate {
 
         statusLabel.font = .systemFont(ofSize: 11); statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
-        let bottom = row([statusLabel, spacer(), button("存储空间", #selector(showStorage), symbol: "internaldrive"), label("本机处理", size: 10)])
+        statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        taskIndicator.style = .spinning; taskIndicator.controlSize = .small; taskIndicator.isDisplayedWhenStopped = false
+        taskIndicator.isHidden = true
+        taskIndicator.widthAnchor.constraint(equalToConstant: 16).isActive = true
+        taskIndicator.heightAnchor.constraint(equalToConstant: 16).isActive = true
+        let undoButton = button("撤销", #selector(undoAction), symbol: "arrow.uturn.backward")
+        let redoButton = button("重做", #selector(redoAction), symbol: "arrow.uturn.forward")
+        undoButton.toolTip = "撤销 · ⌘Z"; redoButton.toolTip = "重做 · ⇧⌘Z"
+        let bottom = row([undoButton, redoButton, taskIndicator, statusLabel, spacer(), button("存储空间", #selector(showStorage), symbol: "internaldrive"), label("本机处理", size: 10)])
         bottom.edgeInsets = NSEdgeInsets(top: 7, left: 16, bottom: 7, right: 16)
         outer.addArrangedSubview(bottom); bottom.widthAnchor.constraint(equalTo: outer.widthAnchor).isActive = true
     }
@@ -305,14 +343,22 @@ final class EditorController: NSObject, NSWindowDelegate {
             for view in pageList.arrangedSubviews { pageList.removeArrangedSubview(view); view.removeFromSuperview() }
             for (index, page) in canvas.document.pages.enumerated() {
                 let entry = button("\(index == canvas.activePage ? "●" : "○")  第 \(index + 1) 页   ·   \(page.elements.count)", #selector(selectPage))
+                entry.setButtonType(.toggle); entry.state = index == canvas.activePage ? .on : .off
+                if index == canvas.activePage {
+                    entry.bezelColor = NSColor(srgbRed: 0.86, green: 0.94, blue: 0.96, alpha: 1)
+                    entry.contentTintColor = .labelColor
+                    entry.attributedTitle = NSAttributedString(string: entry.title, attributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: NSColor.labelColor])
+                }
+                entry.toolTip = "第 \(index + 1) 页，\(page.elements.count) 个对象"
                 entry.tag = index; entry.widthAnchor.constraint(equalToConstant: 138).isActive = true
                 pageList.addArrangedSubview(entry)
             }
         }
         let objects = canvas.document.pages.flatMap(\.elements)
-        let overflows = objects.filter { PageDrawing.overflows($0) }.count
+        let overflows = canvas.overflowCount
         statusLabel.stringValue = overflows > 0 ? "⚠ \(overflows) 个文本框文字溢出：请加高、缩小字号或拆到新页。" : "第 \(canvas.activePage + 1) / \(canvas.document.pages.count) 页 · \(objects.count) 个对象 · \(dirty ? "未保存（每 5 秒自动恢复备份）" : "已保存")"
         statusLabel.textColor = overflows > 0 ? .systemRed : .secondaryLabelColor
+        if let taskName { statusLabel.stringValue = taskName + "… 可切换其他标签"; statusLabel.textColor = .secondaryLabelColor }
     }
     func refreshSelection() {
         if let item = canvas.selectedElement {
@@ -327,28 +373,44 @@ final class EditorController: NSObject, NSWindowDelegate {
             selectionLabel.stringValue = canvas.selectedIDs.isEmpty ? "双击纸面添加文字，或拖入图片。" : "已选择 \(canvas.selectedIDs.count) 个对象"
             geometry.forEach { $0.isEnabled = false }
         }
+        let selected = canvas.selectedElement
+        let isText = selected?.kind == .text
+        textControls.forEach { $0.isEnabled = isText && !exporting }
+        ratioCheck.isEnabled = selected?.kind == .image && !exporting
+        for control in contextualButtons {
+            let imageOnly = control.action == #selector(cropImage) || control.action == #selector(exportSelectedImage)
+            control.isEnabled = !exporting && (imageOnly ? selected?.kind == .image : !canvas.selectedIDs.isEmpty)
+        }
+        if exporting { geometry.forEach { $0.isEnabled = false } }
         refresh()
     }
     func showError(_ error: Error) {
-        let alert = NSAlert(); alert.messageText = "未能完成操作"; alert.informativeText = error.localizedDescription; alert.alertStyle = .warning
+        guard !isClosed else { return }
+        if window.attachedSheet != nil { statusLabel.stringValue = error.localizedDescription; return }
+        let alert = PaperDeskAppearance.alert(); alert.messageText = "未能完成操作"; alert.informativeText = error.localizedDescription; alert.alertStyle = .warning
         alert.beginSheetModal(for: window)
     }
     func withError(_ action: () throws -> Void) { do { try action() } catch { showError(error) } }
     @objc func about() {
-        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.0"
-        let alert = NSAlert(); alert.messageText = "PaperDesk \(version)"; alert.informativeText = "面向作业的本地 A4 图文排版工具。\n\n工程保存完整编辑状态；PDF 固定版式；DOCX 和 Markdown 按内容阅读顺序导出。\n\n首版采用可自由摆放的文字框，文字不会自动流到下一页。"; alert.beginSheetModal(for: window)
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.0"
+        let alert = PaperDeskAppearance.alert(); alert.messageText = "PaperDesk \(version)"; alert.informativeText = "面向作业的本地 A4 图文排版工具。\n\n工程保存完整编辑状态；PDF 固定版式；DOCX 和 Markdown 按内容阅读顺序导出。\n\n首版采用可自由摆放的文字框，文字不会自动流到下一页。"; alert.beginSheetModal(for: window)
     }
     @objc func quit() { NSApp.terminate(nil) }
     @objc func selectPage(_ sender: NSButton) {
+        guard !exporting, canvas.document.pages.indices.contains(sender.tag) else { return }
         canvas.finishEditing(); canvas.activePage = sender.tag; canvas.selectedIDs = []
         canvas.scrollToVisible(canvas.pageRect(sender.tag).insetBy(dx: -10, dy: -25)); refreshSelection(); canvas.needsDisplay = true
     }
     @objc func addPage() {
+        guard !exporting else { return }
+        guard canvas.document.pages.count < 500 else { showError(DeskError.message("最多支持 500 页，请另建一份作业。")); return }
         canvas.finishEditing(); checkpoint()
         canvas.document.pages.append(PaperPage()); canvas.activePage = canvas.document.pages.count - 1; canvas.selectedIDs = []
         didChange(); canvas.scrollToVisible(canvas.pageRect(canvas.activePage)); refreshSelection()
     }
     @objc func duplicatePage() {
+        guard !exporting, canvas.document.pages.indices.contains(canvas.activePage) else { return }
+        guard canvas.document.pages.count < 500 else { showError(DeskError.message("最多支持 500 页，请另建一份作业。")); return }
         canvas.finishEditing(); checkpoint()
         var page = canvas.document.pages[canvas.activePage]; page.id = UUID()
         for i in page.elements.indices { page.elements[i].id = UUID() }
@@ -356,6 +418,7 @@ final class EditorController: NSObject, NSWindowDelegate {
         didChange(); canvas.scrollToVisible(canvas.pageRect(canvas.activePage)); refreshSelection()
     }
     @objc func deletePage() {
+        guard !exporting, canvas.document.pages.indices.contains(canvas.activePage) else { return }
         canvas.finishEditing(); checkpoint()
         canvas.document.pages.remove(at: canvas.activePage)
         if canvas.document.pages.isEmpty { canvas.document.pages = [PaperPage()] }
@@ -367,6 +430,8 @@ final class EditorController: NSObject, NSWindowDelegate {
         insertText(page: canvas.activePage, at: CGPoint(x: area.minX, y: min(area.minY + CGFloat(canvas.document.pages[canvas.activePage].elements.count % 8) * 30, area.maxY - min(80, area.height))))
     }
     func insertText(page: Int, at point: CGPoint) {
+        guard !exporting, canvas.document.pages.indices.contains(page), point.x.isFinite, point.y.isFinite else { return }
+        guard canvas.document.pages[page].elements.count < 2000 else { showError(DeskError.message("本页对象过多，请添加新页。")); return }
         canvas.finishEditing(); checkpoint()
         let x = max(0, min(point.x, paperWidth - 100)), y = max(0, min(point.y, paperHeight - 80))
         let area = canvas.document.contentRect
@@ -376,7 +441,9 @@ final class EditorController: NSObject, NSWindowDelegate {
         canvas.document.pages[page].elements.append(item); canvas.activePage = page; canvas.selectedIDs = [item.id]
         didChange(); canvas.startEditing(item.id)
         canvas.scrollToVisible(CGRect(x: canvas.pageRect(page).minX + x * canvas.zoom, y: canvas.pageRect(page).minY + y * canvas.zoom, width: 100 * canvas.zoom, height: 40 * canvas.zoom))
-        canvas.textEditor?.typingAttributes = TextStyle.make(" ", size: CGFloat(fontSizeField.doubleValue > 0 ? fontSizeField.doubleValue : 14)).attributes(at: 0, effectiveRange: nil)
+        let typedSize = Double(fontSizeField.stringValue) ?? 14
+        let safeSize = typedSize.isFinite && (4...200).contains(typedSize) ? typedSize : 14
+        canvas.textEditor?.typingAttributes = TextStyle.make(" ", size: CGFloat(safeSize)).attributes(at: 0, effectiveRange: nil)
     }
     @objc func addImages() {
         let panel = NSOpenPanel(); panel.allowsMultipleSelection = true; panel.allowedContentTypes = [.image]; panel.canChooseDirectories = false
@@ -385,19 +452,37 @@ final class EditorController: NSObject, NSWindowDelegate {
         }
     }
     func insertImages(_ urls: [URL], page: Int, at point: CGPoint) {
-        withError {
+        guard !exporting, !urls.isEmpty, canvas.document.pages.indices.contains(page), point.x.isFinite, point.y.isFinite else { return }
+        let pageID = canvas.document.pages[page].id
+        guard urls.count + canvas.document.pages[page].elements.count <= 2000 else { showError(DeskError.message("本页对象过多，请分批放到新页。")); return }
+        let existingBytes = canvas.document.pages.flatMap(\.elements).reduce(0) { $0 + ($1.imageData?.count ?? 0) }
+        runTask("正在导入图片", work: {
             var items: [PaperElement] = []
+            var totalBytes = existingBytes
             for (index, url) in urls.enumerated() {
-                let resource = try url.resourceValues(forKeys: [.fileSizeKey]); guard (resource.fileSize ?? 0) <= 200_000_000 else { throw DeskError.message("图片文件超过 200 MB。") }
-                let data = try Data(contentsOf: url); let image = try ImageTools.decode(data)
-                let factor = min(1, min(300 / Double(image.width), 350 / Double(image.height)))
-                var item = PaperElement(kind: .image, x: max(0, point.x) + Double(index % 5) * 22, y: max(0, point.y) + Double(index % 5) * 22, width: Double(image.width) * factor, height: Double(image.height) * factor)
-                item.imageData = data; item.imageName = url.lastPathComponent; item.rect = canvas.clamped(item.rect)
-                items.append(item)
+                try autoreleasepool {
+                    let resource = try url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+                    guard resource.isRegularFile == true, (resource.fileSize ?? 0) <= 140_000_000 else { throw DeskError.message("图片不是普通文件或体积过大，请先压缩。") }
+                    let data = try Data(contentsOf: url)
+                    totalBytes += data.count
+                    guard totalBytes <= 140_000_000 else { throw DeskError.message("图片原件总计超过 140 MB，可能使工程无法保存。请先压缩或分到多份作业。") }
+                    let image = try ImageTools.decodeThumbnail(data, maxPixelSize: 2048)
+                    let factor = min(1, min(300 / Double(image.width), 350 / Double(image.height)))
+                    let width = Double(image.width) * factor, height = Double(image.height) * factor
+                    let item = PaperElement(kind: .image,
+                        x: max(0, min(paperWidth - width, point.x + Double(index % 5) * 22)),
+                        y: max(0, min(paperHeight - height, point.y + Double(index % 5) * 22)),
+                        width: width, height: height, imageData: data, imageName: url.lastPathComponent)
+                    items.append(item)
+                }
             }
-            canvas.finishEditing(); checkpoint(); canvas.document.pages[page].elements.append(contentsOf: items)
-            canvas.activePage = page; canvas.selectedIDs = Set(items.map(\.id)); canvas.invalidateImages(); didChange(); refreshSelection()
-        }
+            return items
+        }, completion: { [weak self] items in
+            guard let self, let target = self.canvas.document.pages.firstIndex(where: { $0.id == pageID }) else { return }
+            self.checkpoint(); self.canvas.document.pages[target].elements.append(contentsOf: items)
+            self.canvas.activePage = target; self.canvas.selectedIDs = Set(items.map(\.id))
+            self.canvas.invalidateImages(); self.didChange(); self.refreshSelection()
+        })
     }
     @objc func deleteSelection() {
         guard !canvas.selectedIDs.isEmpty else { return }
@@ -420,16 +505,18 @@ final class EditorController: NSObject, NSWindowDelegate {
         guard let original = canvas.selectedElement else { return }
         let values = geometry.map { Double($0.stringValue).map { $0 * 72 / 25.4 } ?? .nan }
         guard values.allSatisfy(\.isFinite), values[2] >= 12, values[3] >= 12 else { refreshSelection(); return }
-        canvas.finishEditing(); checkpoint()
+        canvas.finishEditing()
         var rect = CGRect(x: values[0], y: values[1], width: values[2], height: values[3])
         if original.kind == .image && ratioCheck.state == .on {
             if sender === geometry[2] { rect.size.height = rect.width * original.height / original.width }
             if sender === geometry[3] { rect.size.width = rect.height * original.width / original.height }
         }
+        guard [rect.origin.x, rect.origin.y, rect.width, rect.height].allSatisfy(\.isFinite), rect.width > 0, rect.height > 0 else { refreshSelection(); showError(DeskError.message("尺寸超出可计算范围，请输入正常的毫米数值。")); return }
         if rect.width > paperWidth || rect.height > paperHeight {
             let factor = min(paperWidth / rect.width, paperHeight / rect.height); rect.size.width *= factor; rect.size.height *= factor
         }
-        modifySelected { $0.rect = canvas.clamped(rect) }; didChange(); refreshSelection()
+        guard rect.width.isFinite, rect.height.isFinite, rect.width > 0, rect.height > 0 else { refreshSelection(); return }
+        checkpoint(); modifySelected { $0.rect = canvas.clamped(rect) }; didChange(); refreshSelection()
     }
     func modifySelected(_ transform: (inout PaperElement) -> Void) {
         for p in canvas.document.pages.indices { for i in canvas.document.pages[p].elements.indices where canvas.selectedIDs.contains(canvas.document.pages[p].elements[i].id) { transform(&canvas.document.pages[p].elements[i]) } }
@@ -438,6 +525,7 @@ final class EditorController: NSObject, NSWindowDelegate {
     @objc func zoomIn() { setZoom(canvas.document.zoom + 0.1) }
     @objc func zoomOut() { setZoom(canvas.document.zoom - 0.1) }
     func setZoom(_ value: Double) {
+        guard value.isFinite, !exporting else { return }
         let anchor = canvas.captureViewportAnchor()
         canvas.document.zoom = max(0.25, min(3, value)); didChange()
         if let anchor { canvas.restoreViewportAnchor(anchor) }
@@ -506,7 +594,7 @@ final class EditorController: NSObject, NSWindowDelegate {
     }
     @objc func applyAlignment() {
         let values: [NSTextAlignment] = [.left, .center, .right, .justified]
-        let selected = values[max(0, alignment.selectedSegment)]
+        let selected = values[min(values.count - 1, max(0, alignment.selectedSegment))]
         editParagraph { $0.alignment = selected }
     }
     @objc func applyLineHeight() { let multiple = Double(linePicker.titleOfSelectedItem ?? "1.25") ?? 1.25; editParagraph { $0.lineHeightMultiple = multiple; $0.lineSpacing = 0 } }
@@ -535,19 +623,19 @@ final class EditorController: NSObject, NSWindowDelegate {
         canvas.invalidateImages(); didChange(); refreshSelection()
     }
 
-    func mayReplaceDocument() -> Bool {
-        if exporting { showError(DeskError.message("图片仍在导出，请完成后再关闭这个作业。")); return false }
+    func mayReplaceDocument(afterSave: (() -> Void)? = nil) -> Bool {
+        if exporting { showError(DeskError.message("文档任务仍在处理中，请完成后再关闭这个作业。")); return false }
         canvas.finishEditing()
         guard dirty else { return true }
-        let alert = NSAlert(); alert.messageText = "保存“\(canvas.document.title)”？"; alert.informativeText = "当前修改尚未保存到工程文件。"; alert.addButton(withTitle: "保存"); alert.addButton(withTitle: "取消"); alert.addButton(withTitle: "不保存")
+        let alert = PaperDeskAppearance.alert(); alert.messageText = "保存“\(canvas.document.title)”？"; alert.informativeText = "当前修改尚未保存到工程文件。"; alert.addButton(withTitle: "保存"); alert.addButton(withTitle: "取消"); alert.addButton(withTitle: "不保存")
         let response = alert.runModal()
         if response == .alertSecondButtonReturn { return false }
-        if response == .alertFirstButtonReturn { return saveToDisk(forceChoose: false) }
+        if response == .alertFirstButtonReturn { saveToDisk(forceChoose: false, completion: afterSave); return false }
         return true
     }
     @objc func newDocument() {
         if let workspace { workspace.newDocument(from: self); return }
-        guard mayReplaceDocument() else { return }
+        guard mayReplaceDocument(afterSave: { [weak self] in self?.newDocument() }) else { return }
         load(PaperDocument(), url: nil, imported: false); removeRecovery()
     }
     @objc func newWindow() { workspace?.newDocument(from: self, separate: true) }
@@ -572,30 +660,18 @@ final class EditorController: NSObject, NSWindowDelegate {
         if standaloneStorage == nil {
             standaloneStorage = StorageWindowController(activeRecoveryURLs: { [weak self] in self.map { Set([$0.restorationURL]) } ?? [] }, memoryCacheUsage: { [weak self] in
                 (count: self?.canvas.cachedImageCount ?? 0, bytes: Int64(self?.canvas.cachedImageBytes ?? 0))
-            }, clearMemoryCache: { [weak self] in self?.canvas.clearImageCache() })
+            }, clearMemoryCache: { [weak self] in self?.canvas.clearImageCache() }, canDeleteRecoveries: { [weak self] in self?.exporting != true })
         }
         standaloneStorage?.show(relativeTo: window)
     }
     @objc func openDocument() {
-        if workspace == nil && !mayReplaceDocument() { return }
+        if workspace == nil && !mayReplaceDocument(afterSave: { [weak self] in self?.openDocument() }) { return }
         let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = workspace != nil
         panel.allowedContentTypes = [UTType(filenameExtension: "paperdesk") ?? .data, UTType(filenameExtension: "docx") ?? .data, UTType(filenameExtension: "md") ?? .plainText, .plainText]
         panel.message = "每份文件分别打开为标签。支持 PaperDesk 工程、DOCX、Markdown；PDF 仅导出。"
-        if panel.runModal() == .OK {
-            for url in panel.urls {
-                if let workspace { withError { try workspace.open(url, from: workspace.activeEditor ?? self) } }
-                else { openURL(url) }
-            }
-        }
+        if panel.runModal() == .OK { openDocuments(panel.urls) }
     }
-    func openURL(_ url: URL) {
-        withError {
-            let native = url.pathExtension.lowercased() == "paperdesk"
-            let doc = try native ? ProjectStore.read(url) : DocumentConversion.importDocument(from: url)
-            load(doc, url: native ? url : nil, imported: !native)
-            if !native { statusLabel.stringValue = "已导入内容。DOCX / Markdown 的复杂布局可能简化，请检查分页后导出。" }
-        }
-    }
+    func openURL(_ url: URL) { openDocuments([url]) }
     func load(_ doc: PaperDocument, url: URL?, imported: Bool) {
         canvas.finishEditing(); canvas.document = doc; canvas.activePage = 0; canvas.selectedIDs = []; currentURL = url
         undoStack.removeAll(); redoStack.removeAll(); savedDocument = imported ? PaperDocument() : doc
@@ -604,9 +680,10 @@ final class EditorController: NSObject, NSWindowDelegate {
         scroll.contentView.scroll(to: CGPoint(x: max(0, (canvas.bounds.width - scroll.contentSize.width) / 2), y: 0))
         scroll.reflectScrolledClipView(scroll.contentView)
     }
-    @objc func saveDocument() { _ = saveToDisk(forceChoose: false) }
-    @objc func saveAs() { _ = saveToDisk(forceChoose: true) }
-    @discardableResult func saveToDisk(forceChoose: Bool) -> Bool {
+    @objc func saveDocument() { saveToDisk(forceChoose: false) }
+    @objc func saveAs() { saveToDisk(forceChoose: true) }
+    func saveToDisk(forceChoose: Bool, completion: (() -> Void)? = nil) {
+        guard !exporting else { return }
         canvas.finishEditing()
         var destination = currentURL
         if forceChoose || destination == nil {
@@ -617,18 +694,14 @@ final class EditorController: NSObject, NSWindowDelegate {
             }
             panel.directoryURL = currentURL?.deletingLastPathComponent()
             panel.message = "工程保留所有文字、图片原件、裁剪与位置，下次可继续编辑。"
-            guard panel.runModal() == .OK, let url = panel.url else { return false }; destination = url
+            guard panel.runModal() == .OK, let url = panel.url else { return }; destination = url
         }
-        guard let url = destination else { return false }
-        do {
-            try saveProject(to: url); return true
-        } catch { showError(error); return false }
+        guard let url = destination else { return }
+        saveAsynchronously(to: url, completion: completion)
     }
     func saveProject(to url: URL) throws {
         canvas.syncEditing()
-        guard url.standardizedFileURL.resolvingSymlinksInPath() != restorationURL.standardizedFileURL.resolvingSymlinksInPath(), workspace?.canSave(url, for: self) != false else {
-            throw DeskError.message("此路径正在被其他标签或自动恢复备份使用，请选择其他文件名。")
-        }
+        try checkSaveDestination(url)
         var doc = canvas.document; doc.title = url.deletingPathExtension().lastPathComponent
         try ProjectStore.write(doc, to: url)
         canvas.document = doc; savedDocument = doc; currentURL = url; dirty = false; window.isDocumentEdited = false
@@ -642,28 +715,52 @@ final class EditorController: NSObject, NSWindowDelegate {
     }
     @objc func exportPDF() {
         guard let url = chooseExport(ext: "pdf", message: "按 A4 原尺寸导出全部页面，保留画布上的图文位置。") else { return }
-        withError { try PDFExporter.write(canvas.document, to: url); statusLabel.stringValue = "已导出 PDF：\(url.lastPathComponent)" }
+        let snapshot = canvas.document
+        runTask("正在导出 PDF", work: { try PDFExporter.write(snapshot, to: url) }, completion: { [weak self] in self?.statusLabel.stringValue = "已导出 PDF：\(url.lastPathComponent)" })
     }
     @objc func exportDOCX() {
         guard let url = chooseExport(ext: "docx", message: "导出可编辑文字和图片，按页面阅读顺序排列；自由摆放坐标不保留。") else { return }
-        withError { try DocumentConversion.exportDOCX(canvas.document, to: url); statusLabel.stringValue = "已导出 DOCX：\(url.lastPathComponent)" }
+        let snapshot = canvas.document
+        runTask("正在导出 DOCX", work: { try DocumentConversion.exportDOCX(snapshot, to: url) }, completion: { [weak self] in self?.statusLabel.stringValue = "已导出 DOCX：\(url.lastPathComponent)" })
     }
     @objc func exportMarkdown() {
         guard let url = chooseExport(ext: "md", message: "导出文字和图片链接，不保留 A4 坐标、字体或分页。图片保存在旁边的资源文件夹。") else { return }
-        withError { try DocumentConversion.exportMarkdown(canvas.document, to: url); statusLabel.stringValue = "已导出 Markdown 与图片资源。" }
+        let snapshot = canvas.document
+        runTask("正在导出 Markdown", work: { try DocumentConversion.exportMarkdown(snapshot, to: url) }, completion: { [weak self] in self?.statusLabel.stringValue = "已导出 Markdown 与图片资源。" })
     }
     func writeRecovery() {
-        guard dirty else { return }
+        guard dirty, !recoveryPending, !exporting, !isClosed else { return }
         canvas.syncEditing()
-        do {
-            try FileManager.default.createDirectory(at: restorationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try ProjectStore.write(canvas.document, to: restorationURL)
-        } catch { statusLabel.stringValue = "自动恢复备份未成功，请手动保存：\(error.localizedDescription)" }
+        let snapshot = canvas.document
+        guard snapshot != lastRecoveryDocument else { return }
+        let url = restorationURL, generation = recoveryGeneration
+        recoveryPending = true
+        recoveryQueue.async { [weak self] in
+            let result = autoreleasepool { Result {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try ProjectStore.write(snapshot, to: url)
+            } }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.recoveryPending = false
+                guard generation == self.recoveryGeneration, !self.isClosed else { return }
+                switch result {
+                case .success: self.lastRecoveryDocument = snapshot
+                case .failure(let error): self.statusLabel.stringValue = "自动恢复备份未成功，请手动保存：\(error.localizedDescription)"
+                }
+            }
+        }
     }
-    func removeRecovery() { try? FileManager.default.removeItem(at: restorationURL) }
-    func windowWillClose(_ notification: Notification) { autosaveTimer?.invalidate(); workspace?.remove(self) }
+    func removeRecovery() {
+        recoveryGeneration += 1; lastRecoveryDocument = nil
+        let url = restorationURL
+        // Deletion is ordered after already queued writes, preventing a stale backup reappearing.
+        recoveryQueue.async { try? FileManager.default.removeItem(at: url) }
+    }
+    func windowWillClose(_ notification: Notification) { isClosed = true; autosaveTimer?.invalidate(); autosaveTimer = nil; canvas.finishEditing(); workspace?.remove(self) }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        let result = mayReplaceDocument()
+        guard workspace?.isTerminating != true else { return false }
+        let result = mayReplaceDocument(afterSave: { [weak self] in self?.window.performClose(nil) })
         if result { removeRecovery(); dirty = false }
         return result
     }

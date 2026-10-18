@@ -36,6 +36,32 @@ enum ImageTools {
 
     /// ImageIO applies EXIF rotation/mirroring; returned pixels always have upright orientation.
     static func decode(_ data: Data) throws -> CGImage {
+        try decodedImage(data, maximumDimension: nil)
+    }
+
+    /// Ask ImageIO for bounded pixels directly, rather than allocating the full original first.
+    /// Always derive the thumbnail from the primary image; embedded previews may be stale.
+    static func decodeThumbnail(_ data: Data, maxPixelSize: Int = 2048) throws -> CGImage {
+        guard (1...8192).contains(maxPixelSize) else {
+            throw DeskError.message("图片预览尺寸必须在 1～8192 像素之间。")
+        }
+        return try decodedImage(data, maximumDimension: maxPixelSize)
+    }
+
+    /// The crop is applied after EXIF orientation, exactly as for full-resolution export.
+    static func preview(for element: PaperElement, maxPixelSize: Int = 2048) throws -> CGImage {
+        guard element.kind == .image, let data = element.imageData else {
+            throw DeskError.message("未选择图片，或图片资源缺失。")
+        }
+        return try autoreleasepool {
+            let cropped = try crop(decodeThumbnail(data, maxPixelSize: maxPixelSize), to: element.crop)
+            // Detach the crop from its parent and normalize HDR/16-bit thumbnails so
+            // bytesPerRow * height accurately represents the retained preview buffer.
+            return try rasterize(cropped, width: cropped.width, height: cropped.height, opaque: false)
+        }
+    }
+
+    private static func decodedImage(_ data: Data, maximumDimension: Int?) throws -> CGImage {
         guard !data.isEmpty, data.count <= maximumInputBytes else {
             throw DeskError.message("图片为空或超过 200 MB，请先缩小图片。")
         }
@@ -55,7 +81,7 @@ enum ImageTools {
         let options: [CFString: Any] = [
             kCGImageSourceCreateThumbnailFromImageAlways: true,
             kCGImageSourceCreateThumbnailWithTransform: true,
-            kCGImageSourceThumbnailMaxPixelSize: max(width, height),
+            kCGImageSourceThumbnailMaxPixelSize: min(maximumDimension ?? max(width, height), max(width, height)),
             kCGImageSourceShouldCacheImmediately: true
         ]
         guard let image = CGImageSourceCreateThumbnailAtIndex(source, index, options as CFDictionary) else {
@@ -92,27 +118,38 @@ enum ImageTools {
     }
 
     static func encode(_ image: CGImage, format: ImageFormat, quality: Double = 0.9) throws -> Data {
-        try validateDimensions(image.width, image.height)
-        guard quality.isFinite else { throw DeskError.message("图片质量数值无效。") }
-        let available = CGImageDestinationCopyTypeIdentifiers() as? [String] ?? []
-        guard available.contains(format.identifier as String) else {
-            throw DeskError.message("当前系统不支持导出 \(format.title)，请选择 PNG 或 JPEG。")
+        try autoreleasepool {
+            try validateDimensions(image.width, image.height)
+            guard quality.isFinite else { throw DeskError.message("图片质量数值无效。") }
+            // Use standard 8-bit sRGB output. PNG retains alpha; lossy formats use a white backdrop.
+            let pixels = try rasterize(image, width: image.width, height: image.height, opaque: format != .png)
+            return try encodePrepared(pixels, format: format, quality: quality)
         }
-        // Use standard 8-bit sRGB output. PNG retains alpha; lossy formats use a white backdrop.
-        let pixels = try rasterize(image, width: image.width, height: image.height, opaque: format != .png)
-        let buffer = NSMutableData()
-        guard let destination = CGImageDestinationCreateWithData(buffer, format.identifier, 1, nil) else {
-            throw DeskError.message("无法创建图片编码器。")
+    }
+
+    /// Prepared pixels can be reused throughout the quality search; do not allocate another
+    /// full-size RGBA bitmap for each trial (up to ten encodes at the original dimensions).
+    private static func encodePrepared(_ pixels: CGImage, format: ImageFormat, quality: Double) throws -> Data {
+        try autoreleasepool {
+            guard quality.isFinite else { throw DeskError.message("图片质量数值无效。") }
+            let available = CGImageDestinationCopyTypeIdentifiers() as? [String] ?? []
+            guard available.contains(format.identifier as String) else {
+                throw DeskError.message("当前系统不支持导出 \(format.title)，请选择 PNG 或 JPEG。")
+            }
+            let buffer = NSMutableData()
+            guard let destination = CGImageDestinationCreateWithData(buffer, format.identifier, 1, nil) else {
+                throw DeskError.message("无法创建图片编码器。")
+            }
+            let properties: [CFString: Any] = [
+                kCGImageDestinationLossyCompressionQuality: max(0, min(1, quality)),
+                kCGImagePropertyOrientation: 1
+            ]
+            CGImageDestinationAddImage(destination, pixels, properties as CFDictionary)
+            guard CGImageDestinationFinalize(destination), buffer.length > 0 else {
+                throw DeskError.message("\(format.title) 编码失败，请尝试其他格式。")
+            }
+            return buffer as Data
         }
-        let properties: [CFString: Any] = [
-            kCGImageDestinationLossyCompressionQuality: max(0, min(1, quality)),
-            kCGImagePropertyOrientation: 1
-        ]
-        CGImageDestinationAddImage(destination, pixels, properties as CFDictionary)
-        guard CGImageDestinationFinalize(destination), buffer.length > 0 else {
-            throw DeskError.message("\(format.title) 编码失败，请尝试其他格式。")
-        }
-        return buffer as Data
     }
 
     /// Meets the actual byte limit or throws. Lossy output first lowers quality, then dimensions.
@@ -127,16 +164,15 @@ enum ImageTools {
         var width = image.width
         var height = image.height
         for _ in 0..<48 {
-            let current = width == image.width && height == image.height
-                ? image : try rasterize(image, width: width, height: height, opaque: format != .png)
-            let highData = try encode(current, format: format, quality: initialQuality)
+            let current = try rasterize(image, width: width, height: height, opaque: format != .png)
+            let highData = try encodePrepared(current, format: format, quality: initialQuality)
             if highData.count <= limit {
                 return result(highData, image: current, original: image, quality: initialQuality)
             }
             var smallestData = highData
             if format != .png {
                 let minimumQuality = 0.08
-                let lowData = try encode(current, format: format, quality: minimumQuality)
+                let lowData = try encodePrepared(current, format: format, quality: minimumQuality)
                 smallestData = lowData
                 if lowData.count <= limit {
                     var bestData = lowData
@@ -146,7 +182,7 @@ enum ImageTools {
                     // Keep only measured candidates under the limit; encoders can be non-monotonic.
                     for _ in 0..<8 {
                         let midpoint = (low + high) / 2
-                        let candidate = try encode(current, format: format, quality: midpoint)
+                        let candidate = try encodePrepared(current, format: format, quality: midpoint)
                         if candidate.count <= limit {
                             bestData = candidate
                             bestQuality = midpoint

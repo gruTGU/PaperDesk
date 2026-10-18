@@ -8,7 +8,7 @@ NEEDS_BUILD=false
 if [[ ! -x "$EXECUTABLE" || ! -f "$APP_DIR/Contents/Info.plist" || "$PROJECT_DIR/build.sh" -nt "$EXECUTABLE" ]]; then
   NEEDS_BUILD=true
 else
-  for source_file in "$PROJECT_DIR"/Sources/*.swift; do
+  for source_file in "$PROJECT_DIR"/Sources/*.swift "$PROJECT_DIR"/Resources/*; do
     if [[ "$source_file" -nt "$EXECUTABLE" ]]; then NEEDS_BUILD=true; break; fi
   done
 fi

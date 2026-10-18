@@ -13,6 +13,8 @@ case "$HOST_ARCH" in
 esac
 
 mkdir -p "$CACHE_DIR" "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+cp "$PROJECT_DIR/Resources/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
+cp "$PROJECT_DIR/Resources/AppIcon.png" "$APP_DIR/Contents/Resources/AppIcon.png"
 export CLANG_MODULE_CACHE_PATH="$CACHE_DIR"
 
 echo "正在编译 PaperDesk（${HOST_ARCH}，macOS 13+）…"
@@ -36,8 +38,9 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>PaperDesk</string>
   <key>CFBundleDisplayName</key><string>PaperDesk 作业排版</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2.0</string>
-  <key>CFBundleVersion</key><string>3</string>
+  <key>CFBundleShortVersionString</key><string>0.3.0</string>
+  <key>CFBundleVersion</key><string>4</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><false/>
   <key>NSHighResolutionCapable</key><true/>

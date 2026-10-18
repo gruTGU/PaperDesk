@@ -37,7 +37,13 @@ struct PaperElement: Codable, Identifiable, Equatable {
         return value
     }
     mutating func setText(_ value: NSAttributedString) {
-        textRTF = try? value.data(from: NSRange(location: 0, length: value.length), documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf])
+        let serializable = NSMutableAttributedString(attributedString: value)
+        // RTF export with an unsupported font can silently drop joiners in emoji and
+        // other scripts. Resolve each run's fallback font before encoding; the editor
+        // already draws those glyphs using font fallback, so the appearance is retained.
+        let range = NSRange(location: 0, length: serializable.length)
+        serializable.fixFontAttribute(in: range)
+        textRTF = try? serializable.data(from: range, documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf])
     }
     static func text(_ string: String, x: Double = 42.52, y: Double = 42.52, width: Double = 510.23, height: Double = 180, size: CGFloat = 14) -> PaperElement {
         var item = PaperElement(kind: .text, x: x, y: y, width: width, height: height)

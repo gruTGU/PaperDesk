@@ -1,9 +1,12 @@
 import AppKit
+import zlib
 
 /// Conversion is deliberately a reading-order interchange, while the project and PDF keep canvas geometry.
 enum DocumentConversion {
     static func importDocument(from url: URL) throws -> PaperDocument {
-        let size = (try url.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? 0
+        let values = try url.resolvingSymlinksInPath().resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+        guard values.isRegularFile == true else { throw DeskError.message("请选择普通文档文件，不能导入文件夹或特殊设备。") }
+        let size = values.fileSize ?? 0
         guard size <= 80_000_000 else { throw DeskError.message("导入文件超过 80 MB，请先减小文件。") }
         let blocks: [FlowBlock]
         var margins = PageMargins()
@@ -61,6 +64,7 @@ enum DocumentConversion {
     }
 
     static func exportMarkdown(_ document: PaperDocument, to url: URL) throws {
+        try ProjectStore.validate(document)
         let parent = url.deletingLastPathComponent()
         let assetName = "\(url.deletingPathExtension().lastPathComponent)-assets-\(UUID().uuidString.lowercased())"
         let assetURL = parent.appendingPathComponent(assetName, isDirectory: true)
@@ -120,19 +124,26 @@ enum DocumentConversion {
     }
 
     private static func paginate(_ blocks: [FlowBlock], margins: PageMargins = PageMargins()) throws -> PaperDocument {
+        let textLength = blocks.reduce(0) { total, block in
+            if case .text(let text) = block { return total + text.length }
+            return total
+        }
+        guard textLength <= 2_000_000 else { throw DeskError.message("文字内容过长，请拆分导入。") }
         var document = PaperDocument(margins: margins)
         try ProjectStore.validate(document)
         let content = document.contentRect
         var y = content.minY
         let width = content.width, bottom = content.maxY
-        func newPage() throws {
-            guard document.pages.count < 500 else { throw DeskError.message("文档超过 500 页，请拆分后导入。") }
-            if !document.pages[document.pages.count - 1].elements.isEmpty { document.pages.append(PaperPage()) }
+        func newPage(preserveEmpty: Bool = false) throws {
+            if preserveEmpty || !document.pages[document.pages.count - 1].elements.isEmpty {
+                guard document.pages.count < 500 else { throw DeskError.message("文档超过 500 页，请拆分后导入。") }
+                document.pages.append(PaperPage())
+            }
             y = content.minY
         }
         for block in blocks {
             switch block {
-            case .pageBreak: try newPage()
+            case .pageBreak: try newPage(preserveEmpty: true)
             case .image(var item):
                 let maximumHeight = content.height
                 let scale = min(1, width / CGFloat(item.width), maximumHeight / CGFloat(item.height))
@@ -144,24 +155,31 @@ enum DocumentConversion {
             case .text(let text):
                 guard text.length <= 2_000_000 else { throw DeskError.message("文字内容过长，请拆分导入。") }
                 if text.length == 0 { y += 12; continue }
+                // A single text storage shares glyph generation across pages. Rebuilding the
+                // entire remaining paragraph on every page made long imports quadratic.
+                let storage = NSTextStorage(attributedString: text)
+                let layout = NSLayoutManager()
+                layout.backgroundLayoutEnabled = false
+                storage.addLayoutManager(layout)
                 var offset = 0
                 while offset < text.length {
                     if bottom - y < 28 { try newPage() }
-                    let remainder = text.attributedSubstring(from: NSRange(location: offset, length: text.length - offset))
-                    let storage = NSTextStorage(attributedString: remainder)
-                    let layout = NSLayoutManager()
                     let container = NSTextContainer(size: NSSize(width: width, height: bottom - y - 4))
                     container.lineFragmentPadding = 0
-                    layout.addTextContainer(container); storage.addLayoutManager(layout)
+                    layout.addTextContainer(container)
                     let glyphs = layout.glyphRange(for: container)
                     let characters = layout.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
                     if characters.length == 0 {
+                        layout.removeTextContainer(at: layout.textContainers.count - 1)
                         if y > content.minY { try newPage(); continue }
                         throw DeskError.message("文字字号或行高大于一页可用区域，请先减小源文档字号。")
                     }
+                    guard characters.location == offset, NSMaxRange(characters) <= text.length else {
+                        throw DeskError.message("文字分页失败，请尝试将源文档拆成较短段落。")
+                    }
                     let height = min(bottom - y, max(20, ceil(layout.usedRect(for: container).height) + 4))
                     var item = PaperElement(kind: .text, x: content.minX, y: y, width: width, height: height)
-                    item.setText(remainder.attributedSubstring(from: characters))
+                    item.setText(text.attributedSubstring(from: characters))
                     document.pages[document.pages.count - 1].elements.append(item)
                     offset += characters.length; y += height + 6
                     if offset < text.length { try newPage() }
@@ -173,15 +191,16 @@ enum DocumentConversion {
     }
 
     private static func readMarkdown(_ source: String, base: URL) throws -> [FlowBlock] {
-        guard source.utf8.count <= 12_000_000 else { throw DeskError.message("Markdown 文字超过 12 MB，请拆分导入。") }
-        var result: [FlowBlock] = [], paragraph: [String] = [], inCode = false, code: [String] = []
+        guard source.utf8.count <= 12_000_000, source.utf16.count <= 2_000_000 else { throw DeskError.message("Markdown 文字内容过长，请拆分导入。") }
+        var result: [FlowBlock] = [], paragraph: [String] = [], inCode = false, code: [String] = [], imageBytes = 0
         func flush() throws {
             if !paragraph.isEmpty {
-                try appendMarkdownParagraph(paragraph.joined(separator: "\n"), base: base, to: &result)
+                try appendMarkdownParagraph(paragraph.joined(separator: "\n"), base: base, to: &result, imageBytes: &imageBytes)
                 paragraph.removeAll()
             }
         }
         for raw in source.components(separatedBy: .newlines) {
+            guard result.count <= 20_000 else { throw DeskError.message("Markdown 段落和图片过多，请拆分导入。") }
             let line = raw.trimmingCharacters(in: .whitespaces)
             if line.hasPrefix("```") {
                 try flush()
@@ -196,14 +215,14 @@ enum DocumentConversion {
             if line == "<!-- PaperDesk page break -->" { try flush(); result.append(.pageBreak); continue }
             if line.isEmpty { try flush(); continue }
             if line.range(of: "^(#{1,6} +|[-*+] +|[0-9]+[.)] +|!\\[)", options: .regularExpression) != nil {
-                try flush(); try appendMarkdownParagraph(line, base: base, to: &result)
+                try flush(); try appendMarkdownParagraph(line, base: base, to: &result, imageBytes: &imageBytes)
             } else { paragraph.append(raw) }
         }
         try flush()
         if inCode { result.append(.text(TextStyle.make(code.joined(separator: "\n"), size: 12))) }
         return result
     }
-    private static func appendMarkdownParagraph(_ original: String, base: URL, to blocks: inout [FlowBlock]) throws {
+    private static func appendMarkdownParagraph(_ original: String, base: URL, to blocks: inout [FlowBlock], imageBytes: inout Int) throws {
         var content = original, size: CGFloat = 14, bold = false
         if let range = content.range(of: "^#{1,6} +", options: .regularExpression) {
             let count = content[range].filter { $0 == "#" }.count
@@ -214,6 +233,7 @@ enum DocumentConversion {
         let regex = try NSRegularExpression(pattern: #"!\[((?:\\.|[^\]])*)\]\(\s*(<[^>]+>|[^\s)]+)(?:\s+\"[^\"]*\")?\s*\)"#)
         let ns = content as NSString
         let matches = regex.matches(in: content, range: NSRange(location: 0, length: ns.length))
+        guard blocks.count + matches.count * 2 <= 20_000 else { throw DeskError.message("Markdown 段落和图片过多，请拆分导入。") }
         var position = 0
         for match in matches {
             if match.range.location > position {
@@ -229,8 +249,12 @@ enum DocumentConversion {
             let imageURL = root.appendingPathComponent(decoded).standardizedFileURL.resolvingSymlinksInPath()
             guard imageURL.path.hasPrefix(root.path + "/") else { throw DeskError.message("Markdown 图片不能引用文档目录之外的文件：\(path)") }
             guard FileManager.default.fileExists(atPath: imageURL.path) else { throw DeskError.message("Markdown 图片不存在：\(path)") }
-            let fileSize = (try imageURL.resourceValues(forKeys: [.fileSizeKey])).fileSize ?? 0
+            let values = try imageURL.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+            guard values.isRegularFile == true else { throw DeskError.message("Markdown 图片必须是普通文件：\(path)") }
+            let fileSize = values.fileSize ?? 0
             guard fileSize <= 80_000_000 else { throw DeskError.message("Markdown 图片超过 80 MB：\(path)") }
+            imageBytes += fileSize
+            guard imageBytes <= 160_000_000 else { throw DeskError.message("Markdown 图片总量过大，请减少图片或拆分文档。") }
             blocks.append(.image(try imageElement(Data(contentsOf: imageURL), name: imageURL.lastPathComponent)))
             position = NSMaxRange(match.range)
         }
@@ -248,10 +272,11 @@ enum DocumentConversion {
             var font = value.length > 0 ? value.attribute(.font, at: 0, effectiveRange: nil) as? NSFont : nil
             if intent.contains(.code) { font = NSFont.monospacedSystemFont(ofSize: size, weight: .regular) }
             if let current = font {
-                var traits = NSFontManager.shared.traits(of: current)
-                if intent.contains(.stronglyEmphasized) { traits.insert(.boldFontMask) }
-                if intent.contains(.emphasized) { traits.insert(.italicFontMask) }
-                value.addAttribute(.font, value: NSFontManager.shared.convert(current, toHaveTrait: traits), range: NSRange(location: 0, length: value.length))
+                var traits = current.fontDescriptor.symbolicTraits
+                if intent.contains(.stronglyEmphasized) { traits.insert(.bold) }
+                if intent.contains(.emphasized) { traits.insert(.italic) }
+                let styled = NSFont(descriptor: current.fontDescriptor.withSymbolicTraits(traits), size: current.pointSize) ?? current
+                value.addAttribute(.font, value: styled, range: NSRange(location: 0, length: value.length))
             }
             if let link = run.link { value.addAttribute(.link, value: link, range: NSRange(location: 0, length: value.length)) }
             result.append(value)
@@ -261,7 +286,7 @@ enum DocumentConversion {
     private static func markdownParagraph(_ text: NSAttributedString) -> String {
         if text.length == 0 { return "" }
         let font = text.attribute(.font, at: 0, effectiveRange: nil) as? NSFont
-        let isBold = font.map { NSFontManager.shared.traits(of: $0).contains(.boldFontMask) } ?? false
+        let isBold = font?.fontDescriptor.symbolicTraits.contains(.bold) ?? false
         let level = isBold ? ((font?.pointSize ?? 14) >= 24 ? 1 : (font?.pointSize ?? 14) >= 20 ? 2 : (font?.pointSize ?? 14) >= 17 ? 3 : 0) : 0
         var output = ""
         text.enumerateAttributes(in: NSRange(location: 0, length: text.length)) { attrs, range, _ in
@@ -271,9 +296,9 @@ enum DocumentConversion {
             if core.isEmpty { output += raw; return }
             var content = markdownEscape(core)
             let font = attrs[.font] as? NSFont ?? NSFont.systemFont(ofSize: 14)
-            let traits = NSFontManager.shared.traits(of: font)
-            if traits.contains(.italicFontMask) { content = "*\(content)*" }
-            if traits.contains(.boldFontMask) && level == 0 { content = "**\(content)**" }
+            let traits = font.fontDescriptor.symbolicTraits
+            if traits.contains(.italic) { content = "*\(content)*" }
+            if traits.contains(.bold) && level == 0 { content = "**\(content)**" }
             if let link = attrs[.link] { content = "[\(content)](\(String(describing: link).replacingOccurrences(of: ")", with: "%29")))" }
             output += leading + content + trailing
         }
@@ -295,10 +320,10 @@ enum DocumentConversion {
         var result = "<w:p><w:pPr><w:jc w:val=\"\(alignment)\"/><w:spacing w:before=\"\(before)\" w:after=\"\(after)\"/></w:pPr>"
         text.enumerateAttributes(in: NSRange(location: 0, length: text.length)) { attrs, range, _ in
             let font = attrs[.font] as? NSFont ?? NSFont.systemFont(ofSize: 14)
-            let traits = NSFontManager.shared.traits(of: font)
+            let traits = font.fontDescriptor.symbolicTraits
             var properties = "<w:rFonts w:ascii=\"\(xml(font.familyName ?? font.fontName))\" w:hAnsi=\"\(xml(font.familyName ?? font.fontName))\" w:eastAsia=\"\(xml(font.familyName ?? font.fontName))\"/><w:sz w:val=\"\(Int(font.pointSize * 2))\"/><w:szCs w:val=\"\(Int(font.pointSize * 2))\"/>"
-            if traits.contains(.boldFontMask) { properties += "<w:b/>" }
-            if traits.contains(.italicFontMask) { properties += "<w:i/>" }
+            if traits.contains(.bold) { properties += "<w:b/>" }
+            if traits.contains(.italic) { properties += "<w:i/>" }
             if (attrs[.underlineStyle] as? Int ?? 0) != 0 { properties += "<w:u w:val=\"single\"/>" }
             if let color = (attrs[.foregroundColor] as? NSColor)?.usingColorSpace(.sRGB) {
                 properties += String(format: "<w:color w:val=\"%02X%02X%02X\"/>", Int(color.redComponent * 255), Int(color.greenComponent * 255), Int(color.blueComponent * 255))
@@ -341,8 +366,10 @@ enum DocumentConversion {
         }
         func attributes() -> [NSAttributedString.Key: Any] {
             var font = NSFont(name: name ?? "PingFangSC-Regular", size: size ?? 14) ?? NSFont.systemFont(ofSize: size ?? 14)
-            if bold == true { font = NSFontManager.shared.convert(font, toHaveTrait: .boldFontMask) }
-            if italic == true { font = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask) }
+            var traits = font.fontDescriptor.symbolicTraits
+            if bold == true { traits.insert(.bold) }
+            if italic == true { traits.insert(.italic) }
+            font = NSFont(descriptor: font.fontDescriptor.withSymbolicTraits(traits), size: font.pointSize) ?? font
             let p = NSMutableParagraphStyle(); p.lineSpacing = 4; p.paragraphSpacing = 8; p.alignment = alignment ?? .left
             var result: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color ?? NSColor.black, .paragraphStyle: p]
             if underline == true { result[.underlineStyle] = NSUnderlineStyle.single.rawValue }
@@ -393,7 +420,7 @@ enum DocumentConversion {
                                       right: points("right", default: margins.right))
             guard margins.isValid else { throw DeskError.message("DOCX 页边距超出 A4 可用区域，请在 Word 中调整后导入。") }
         }
-        var blocks: [FlowBlock] = []
+        var blocks: [FlowBlock] = [], imageBytes = 0
         for paragraph in body.descendants("p") {
             let properties = paragraph.child("pPr")
             var paragraphFormat = format(properties?.child("pStyle")?.attributes["val"])
@@ -425,7 +452,10 @@ enum DocumentConversion {
                         let extent = part.firstDescendant("extent")
                         let width = extent?.attributes["cx"].flatMap(Double.init).map { CGFloat($0) / 12700 }
                         let height = extent?.attributes["cy"].flatMap(Double.init).map { CGFloat($0) / 12700 }
-                        var image = try imageElement(archive.read(path), name: (path as NSString).lastPathComponent, width: width, height: height)
+                        let imageData = try archive.read(path)
+                        imageBytes += imageData.count
+                        guard imageBytes <= 160_000_000 else { throw DeskError.message("DOCX 图片总量过大，请减少图片或拆分文档。") }
+                        var image = try imageElement(imageData, name: (path as NSString).lastPathComponent, width: width, height: height)
                         if let crop = part.firstDescendant("srcRect") {
                             let left = Double(crop.attributes["l"] ?? "0") ?? 0, top = Double(crop.attributes["t"] ?? "0") ?? 0
                             let right = Double(crop.attributes["r"] ?? "0") ?? 0, bottom = Double(crop.attributes["b"] ?? "0") ?? 0
@@ -456,7 +486,7 @@ enum DocumentConversion {
         guard data.count <= 12_000_000 else { throw DeskError.message("DOCX XML 过大，请拆分导入。") }
         let parser = XMLParser(data: data), delegate = XMLTreeBuilder()
         parser.shouldResolveExternalEntities = false; parser.delegate = delegate
-        guard parser.parse(), let root = delegate.root else { throw DeskError.message("DOCX XML 已损坏，无法导入。") }
+        guard parser.parse(), let root = delegate.root else { throw DeskError.message(delegate.failureReason ?? "DOCX XML 已损坏，无法导入。") }
         return root
     }
 }
@@ -471,20 +501,50 @@ private final class XMLNode {
 }
 private final class XMLTreeBuilder: NSObject, XMLParserDelegate {
     var root: XMLNode?, stack: [XMLNode] = []
+    var failureReason: String?
+    private var nodeCount = 0, textLength = 0
+    private func reject(_ parser: XMLParser, _ message: String) {
+        failureReason = message
+        parser.abortParsing()
+    }
     func parser(_ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?, qualifiedName qName: String?, attributes attributeDict: [String: String]) {
+        guard failureReason == nil else { return }
+        nodeCount += 1
+        guard nodeCount <= 100_000, stack.count < 150 else {
+            reject(parser, "DOCX XML 结构过于复杂，请拆分或简化文档后导入。")
+            return
+        }
         var attrs: [String: String] = [:]
         for (key, value) in attributeDict { attrs[String(key.split(separator: ":").last ?? Substring(key))] = value }
         let node = XMLNode(name: String(elementName.split(separator: ":").last ?? Substring(elementName)), attributes: attrs)
         if let parent = stack.last { parent.children.append(node) } else { root = node }; stack.append(node)
-        if stack.count > 150 { parser.abortParsing() }
     }
-    func parser(_ parser: XMLParser, foundCharacters string: String) { stack.last?.text += string }
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        guard failureReason == nil else { return }
+        textLength += string.utf16.count
+        guard textLength <= 2_000_000 else {
+            reject(parser, "DOCX XML 文字过多，请拆分文档后导入。")
+            return
+        }
+        stack.last?.text += string
+    }
+    func parser(_ parser: XMLParser, foundInternalEntityDeclarationWithName name: String, value: String?) {
+        reject(parser, "DOCX XML 含不支持的实体声明，请在 Word 中重新另存为 DOCX。")
+    }
+    func parser(_ parser: XMLParser, foundExternalEntityDeclarationWithName name: String, publicID: String?, systemID: String?) {
+        reject(parser, "DOCX XML 含外部实体，请在 Word 中重新另存为 DOCX。")
+    }
     func parser(_ parser: XMLParser, didEndElement elementName: String, namespaceURI: String?, qualifiedName qName: String?) { if !stack.isEmpty { stack.removeLast() } }
 }
 
 /// Store-only ZIP output keeps this app dependency-free. PNG payloads are already compressed.
 private enum StoredZIP {
-    static func write(_ entries: [(String, Data)]) -> Data {
+    static func write(_ entries: [(String, Data)]) throws -> Data {
+        guard entries.count <= Int(UInt16.max),
+              entries.allSatisfy({ $0.0.utf8.count <= Int(UInt16.max) && $0.1.count <= 200_000_000 }),
+              entries.reduce(0, { $0 + $1.1.count + $1.0.utf8.count * 2 + 76 }) <= 200_000_000 else {
+            throw DeskError.message("DOCX 导出内容过大，请减少图片或拆分文档。原文件未被覆盖。")
+        }
         var output = Data(), central = Data()
         for (name, data) in entries {
             let filename = Data(name.utf8), crc = checksum(data), offset = UInt32(output.count), size = UInt32(data.count)
@@ -496,9 +556,9 @@ private enum StoredZIP {
         return output
     }
     static func checksum(_ data: Data) -> UInt32 {
-        var crc: UInt32 = 0xffffffff
-        for byte in data { crc ^= UInt32(byte); for _ in 0..<8 { crc = (crc >> 1) ^ (crc & 1 == 1 ? 0xedb88320 : 0) } }
-        return crc ^ 0xffffffff
+        data.withUnsafeBytes { raw in
+            UInt32(zlib.crc32(0, raw.bindMemory(to: Bytef.self).baseAddress, uInt(data.count)))
+        }
     }
 }
 private extension Data {
@@ -508,56 +568,77 @@ private extension Data {
     func u32(_ offset: Int) -> Int { u16(offset) | u16(offset + 2) << 16 }
 }
 private struct ReadZIP {
-    struct Entry { let method: Int, size: Int, compressed: Int, offset: Int, crc: UInt32 }
-    let url: URL, data: Data
+    struct Entry { let method: Int, size: Int, compressed: Int, offset: Int, flags: Int, crc: UInt32 }
+    let data: Data, centralOffset: Int
     var entries: [String: Entry] = [:]
     init(_ url: URL) throws {
-        self.url = url; data = try Data(contentsOf: url, options: .mappedIfSafe)
+        data = try Data(contentsOf: url)
         guard data.count >= 22 else { throw DeskError.message("DOCX 不是有效的 ZIP 文档。") }
         var end: Int?
         for position in stride(from: data.count - 22, through: max(0, data.count - 65557), by: -1) {
             if data.u32(position) == 0x06054b50 && position + 22 + data.u16(position + 20) == data.count { end = position; break }
         }
-        guard let end, data.u16(end + 4) == 0, data.u16(end + 6) == 0, data.u16(end + 10) < 5000 else { throw DeskError.message("不支持此 DOCX 压缩结构。请用 Word 另存为普通 DOCX。") }
-        var position = data.u32(end + 16), total = 0
+        guard let end, data.u16(end + 4) == 0, data.u16(end + 6) == 0,
+              data.u16(end + 8) == data.u16(end + 10), data.u16(end + 10) < 5000 else { throw DeskError.message("不支持此 DOCX 压缩结构。请用 Word 另存为普通 DOCX。") }
+        centralOffset = data.u32(end + 16)
+        guard centralOffset <= end, data.u32(end + 12) == end - centralOffset else { throw DeskError.message("DOCX 目录大小或位置已损坏。") }
+        var position = centralOffset, total = 0
         for _ in 0..<data.u16(end + 10) {
-            guard position >= 0, position + 46 <= data.count, data.u32(position) == 0x02014b50 else { throw DeskError.message("DOCX 目录结构已损坏。") }
+            guard position + 46 <= end, data.u32(position) == 0x02014b50 else { throw DeskError.message("DOCX 目录结构已损坏。") }
             let nameCount = data.u16(position + 28), extra = data.u16(position + 30), comment = data.u16(position + 32)
-            guard position + 46 + nameCount + extra + comment <= data.count, data.u16(position + 8) & 1 == 0 else { throw DeskError.message("DOCX 已加密或损坏，请先解密后导入。") }
-            guard let name = String(data: data.subdata(in: position + 46..<position + 46 + nameCount), encoding: .utf8), entries[name] == nil else { throw DeskError.message("DOCX 存在无效或重复的资源名称。") }
+            guard position + 46 + nameCount + extra + comment <= end, data.u16(position + 8) & 1 == 0,
+                  data.u16(position + 34) == 0 else { throw DeskError.message("DOCX 已加密或损坏，请先解密后导入。") }
+            guard let name = String(data: data.subdata(in: position + 46..<position + 46 + nameCount), encoding: .utf8),
+                  !name.isEmpty, !name.contains("\0"), entries[name] == nil else { throw DeskError.message("DOCX 存在无效或重复的资源名称。") }
             let size = data.u32(position + 24), compressed = data.u32(position + 20), offset = data.u32(position + 42)
             total += size
             guard size <= 100_000_000, total <= 200_000_000 else { throw DeskError.message("DOCX 解压后内容过大，请压缩图片或拆分文件。") }
-            entries[name] = Entry(method: data.u16(position + 10), size: size, compressed: compressed, offset: offset, crc: UInt32(data.u32(position + 16)))
+            entries[name] = Entry(method: data.u16(position + 10), size: size, compressed: compressed, offset: offset,
+                                  flags: data.u16(position + 8), crc: UInt32(data.u32(position + 16)))
             position += 46 + nameCount + extra + comment
         }
+        guard position == end else { throw DeskError.message("DOCX 目录条目数量不一致。") }
     }
     func contains(_ name: String) -> Bool { entries[name] != nil }
     func read(_ name: String) throws -> Data {
         guard let entry = entries[name] else { throw DeskError.message("DOCX 缺少资源：\(name)") }
         let offset = entry.offset
-        guard offset >= 0, offset + 30 <= data.count, data.u32(offset) == 0x04034b50 else { throw DeskError.message("DOCX 资源结构已损坏。") }
-        let start = offset + 30 + data.u16(offset + 26) + data.u16(offset + 28)
-        guard start + entry.compressed <= data.count else { throw DeskError.message("DOCX 资源内容不完整。") }
+        guard offset + 30 <= centralOffset, data.u32(offset) == 0x04034b50,
+              data.u16(offset + 6) == entry.flags, data.u16(offset + 8) == entry.method else { throw DeskError.message("DOCX 资源结构已损坏。") }
+        let nameCount = data.u16(offset + 26)
+        let start = offset + 30 + nameCount + data.u16(offset + 28)
+        guard start + entry.compressed <= centralOffset,
+              String(data: data.subdata(in: offset + 30..<offset + 30 + nameCount), encoding: .utf8) == name else {
+            throw DeskError.message("DOCX 资源内容不完整或名称不一致。")
+        }
         if entry.method == 0 {
             let value = data.subdata(in: start..<start + entry.compressed)
             guard value.count == entry.size, StoredZIP.checksum(value) == entry.crc else { throw DeskError.message("DOCX 资源校验失败。") }
             return value
         }
         guard entry.method == 8 else { throw DeskError.message("DOCX 使用了不支持的压缩方式，请在 Word 中重新另存为 DOCX。") }
-        let process = Process(), pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-        // unzip accepts filename patterns: quote their metacharacters, without invoking a shell.
-        let pattern = name.map { c -> String in switch c { case "[": return "[[]"; case "?": return "[?]"; case "*": return "[*]"; default: return String(c) } }.joined()
-        process.arguments = ["-p", url.path, pattern]; process.standardOutput = pipe; process.standardError = FileHandle.nullDevice
-        try process.run()
-        var result = Data()
-        while let chunk = try pipe.fileHandleForReading.read(upToCount: 65536), !chunk.isEmpty {
-            result.append(chunk)
-            if result.count > entry.size { process.terminate(); process.waitUntilExit(); throw DeskError.message("DOCX 资源大小与目录不一致。") }
+        // ZIP stores raw DEFLATE, so use a negative window size (no zlib/gzip header).
+        // A one-byte sentinel catches dishonest size declarations without expanding a bomb.
+        // No subprocess, pipes, filename patterns, or second read of a changing source file.
+        var result = Data(count: entry.size + 1), stream = z_stream()
+        guard inflateInit2_(&stream, -MAX_WBITS, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size)) == Z_OK else {
+            throw DeskError.message("无法初始化 DOCX 解压器。")
         }
-        process.waitUntilExit()
-        guard process.terminationStatus == 0, result.count == entry.size, StoredZIP.checksum(result) == entry.crc else { throw DeskError.message("DOCX 资源解压或校验失败。") }
+        defer { inflateEnd(&stream) }
+        let status = result.withUnsafeMutableBytes { output in
+            data.withUnsafeBytes { input in
+                stream.next_in = UnsafeMutablePointer(mutating: input.bindMemory(to: Bytef.self).baseAddress!.advanced(by: start))
+                stream.avail_in = uInt(entry.compressed)
+                stream.next_out = output.bindMemory(to: Bytef.self).baseAddress!
+                stream.avail_out = uInt(entry.size + 1)
+                return inflate(&stream, Z_FINISH)
+            }
+        }
+        guard status == Z_STREAM_END, stream.total_in == entry.compressed, stream.total_out == entry.size else {
+            throw DeskError.message("DOCX 资源解压失败、内容不完整或大小与目录不一致。")
+        }
+        result.removeLast()
+        guard StoredZIP.checksum(result) == entry.crc else { throw DeskError.message("DOCX 资源校验失败。") }
         return result
     }
 }

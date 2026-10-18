@@ -16,6 +16,7 @@ func testWorkspace() throws {
     first.checkpoint(); first.canvas.document.title = "甲的新标题"; first.didChange()
     second.checkpoint(); second.canvas.document.title = "乙的新标题"; second.didChange()
     first.writeRecovery(); second.writeRecovery()
+    first.recoveryQueue.sync {}; second.recoveryQueue.sync {}
     let recoveryA = try ProjectStore.read(first.restorationURL), recoveryB = try ProjectStore.read(second.restorationURL)
     try require(recoveryA.title == "甲的新标题" && recoveryB.title == "乙的新标题", "recovery content must not overwrite the other document")
     for destination in [first.restorationURL, second.restorationURL] {
@@ -35,6 +36,7 @@ func testWorkspace() throws {
     first.checkpoint(); first.canvas.document.pages[0].elements.append(.text("副本新增内容", y: 250)); first.didChange()
     let copy = folder.appendingPathComponent("副本.paperdesk")
     try first.saveProject(to: copy)
+    first.recoveryQueue.sync {}
     let unchanged = try Data(contentsOf: original)
     let copied = try ProjectStore.read(copy)
     try require(unchanged == originalBytes && copied.pages[0].elements.count == 2 && first.currentURL == copy && !first.dirty, "Save As keeps the original intact and switches the active destination")
@@ -60,5 +62,40 @@ func testWorkspace() throws {
     first.window.setContentSize(NSSize(width: 1080, height: 680))
     first.window.contentView?.layoutSubtreeIfNeeded(); first.updateLayout()
     try require(first.scroll.frame.width >= 600 && first.scroll.frame.height >= 350, "minimum window size must leave a usable canvas")
-    print("PASS independent documents, undo/recovery isolation, Save As original preservation, open/save conflict protection, four margin controls and minimum window layout")
+
+    // Both names are absent while the writer is held. Symlink resolution cannot
+    // canonicalize their casing yet, so reservations must use the volume's rules.
+    let caseSensitive = (try folder.resourceValues(forKeys: [.volumeSupportsCaseSensitiveNamesKey])).volumeSupportsCaseSensitiveNames ?? false
+    let queuedURL = folder.appendingPathComponent("Homework.paperdesk")
+    let caseAlias = folder.appendingPathComponent("homework.paperdesk")
+    let workerGate = DispatchSemaphore(value: 0)
+    DocumentTasks.queue.async { _ = workerGate.wait(timeout: .now() + 10) }
+    defer { workerGate.signal() }
+    first.saveAsynchronously(to: queuedURL)
+    try require(first.pendingSaveURL == queuedURL && first.exporting, "asynchronous save must reserve the absent destination immediately")
+    try require(!FileManager.default.fileExists(atPath: queuedURL.path), "held writer must not create its destination before conflict checks")
+    try require(workspace.canSave(caseAlias, for: second) == caseSensitive,
+                "case aliases must conflict on insensitive volumes, and remain distinct on sensitive volumes")
+    try require(workspace.isActiveRecoveryURL(caseAlias) == !caseSensitive,
+                "recovery protection must include case-equivalent pending save destinations")
+    if !caseSensitive {
+        try require(workspace.owner(of: caseAlias) === first, "pending case alias must activate its existing owner")
+        let pendingOwner = try workspace.open(caseAlias, present: false)
+        try require(pendingOwner === first && workspace.editors.count == 2, "opening a pending case alias must not read a nonexistent file or create another owner")
+    }
+    let composed = folder.appendingPathComponent("Café.paperdesk")
+    let decomposed = folder.appendingPathComponent("Cafe\u{301}.paperdesk")
+    try require(DocumentPathIdentity.matches(composed, decomposed), "canonically equivalent Unicode filenames must share a reservation key")
+    let nestedUpper = folder.appendingPathComponent("AbsentFolder/Nested/Task.paperdesk")
+    let nestedLower = folder.appendingPathComponent("absentfolder/nested/task.paperdesk")
+    try require(DocumentPathIdentity.matches(nestedUpper, nestedLower) == !caseSensitive,
+                "uncreated parent directories must inherit the closest existing ancestor's volume rules")
+    workerGate.signal()
+    let saveDeadline = Date().addingTimeInterval(15)
+    while first.exporting && Date() < saveDeadline { RunLoop.current.run(until: Date().addingTimeInterval(0.005)) }
+    try require(!first.exporting && first.pendingSaveURL == nil, "held save must finish and release its reservation")
+    let caseSaved = try ProjectStore.read(queuedURL)
+    try require(caseSaved == first.canvas.document && !first.dirty, "reservation checks must preserve the first writer's document")
+    first.recoveryQueue.sync {}; second.recoveryQueue.sync {}
+    print("PASS independent documents, undo/recovery isolation, Save As original preservation, volume-aware pending-path reservations, Unicode aliases, open/save conflict protection, four margin controls and minimum window layout")
 }

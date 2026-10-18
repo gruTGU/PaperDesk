@@ -1,7 +1,10 @@
 import AppKit
 
 @main enum UISmoke {
-    static func main() throws {
+    static func main() {
+        do { try run() } catch { print("FAIL \(error.localizedDescription)"); exit(1) }
+    }
+    static func run() throws {
         _ = NSApplication.shared
         NSApp.setActivationPolicy(.prohibited)
         let base = URL(fileURLWithPath: CommandLine.arguments[1])
@@ -32,6 +35,7 @@ import AppKit
         }
         try testCanvasNavigation()
         try testWorkspace()
+        try testEditorReliability()
         let context = CGContext(data: nil, width: 192, height: 128, bitsPerComponent: 8, bytesPerRow: 192 * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
         for (i, color) in [NSColor.systemTeal, .systemOrange, .systemBlue, .systemYellow].enumerated() {
             context.setFillColor(color.cgColor)
@@ -49,6 +53,10 @@ import AppKit
         print("root=\(root.frame) scroll=\(controller.scroll.frame) canvas=\(controller.canvas.frame) inspector=\(controller.inspector.frame)")
         print("ambiguous root=\(root.hasAmbiguousLayout) inspector=\(controller.inspector.hasAmbiguousLayout) pageList=\(controller.pageList.frame)")
         guard controller.scroll.frame.width > 500, controller.scroll.frame.height > 400 else { fatalError("editor layout collapsed") }
+        controller.canvas.rebuildImages()
+        let previewDeadline = Date().addingTimeInterval(10)
+        while controller.canvas.pendingPreviewCount > 0 && Date() < previewDeadline { RunLoop.current.run(until: Date().addingTimeInterval(0.005)) }
+        guard controller.canvas.cachedImageCount == 1 else { throw DeskError.message("UI preview did not load") }
         let rep = root.bitmapImageRepForCachingDisplay(in: root.bounds)!
         root.cacheDisplay(in: root.bounds, to: rep)
         try rep.representation(using: .png, properties: [:])!.write(to: base.appendingPathComponent("interface.png"))
