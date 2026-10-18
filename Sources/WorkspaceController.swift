@@ -88,7 +88,9 @@ final class WorkspaceController {
         }
         let native = url.pathExtension.lowercased() == "paperdesk"
         let document = try native ? ProjectStore.read(url) : DocumentConversion.importDocument(from: url)
-        return create(document: document, url: native ? url : nil, imported: !native, tabbedWith: editor, present: present)
+        let opened = create(document: document, url: native ? url : nil, imported: !native, tabbedWith: editor, present: present)
+        opened.fileExperience.sourceURL = url
+        return opened
     }
 
     func remove(_ editor: EditorController) {
@@ -121,6 +123,13 @@ final class WorkspaceController {
             editor.window.makeKeyAndOrderFront(nil)
             if !editor.mayReplaceDocument(afterSave: { NSApp.terminate(nil) }) { return false }
             confirmed[ObjectIdentifier(editor)] = editor.canvas.document
+        }
+        // A modal save/discard prompt pumps events. An already-confirmed window can
+        // start an export without changing its document snapshot during that prompt.
+        if let busy = editors.first(where: \.exporting) {
+            busy.window.makeKeyAndOrderFront(nil)
+            busy.showError(DeskError.message("文档任务仍在处理中，请完成后再退出。"))
+            return false
         }
         isTerminating = true
         editors.forEach { $0.autosaveTimer?.invalidate(); $0.setWorking("正在退出"); $0.removeRecovery() }

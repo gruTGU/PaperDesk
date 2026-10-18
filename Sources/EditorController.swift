@@ -34,6 +34,9 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
     var geometry: [NSTextField] = []
     let ratioCheck = NSButton(checkboxWithTitle: "图片保持比例", target: nil, action: nil)
     var currentURL: URL?
+    var fileExperience = DocumentFileExperience()
+    var lastOutputURL: URL?
+    let outputButton = NSButton(title: "在 Finder 中显示", target: nil, action: nil)
     var pendingSaveURL: URL?
     var dirty = false
     var savedDocument = PaperDocument()
@@ -52,6 +55,8 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
     var isClosed = false
     var contextualButtons: [NSButton] = []
     var textControls: [NSControl] = []
+    var styleButtons: [NSButton] = []
+    let locateOverflowButton = NSButton(title: "定位溢出", target: nil, action: nil)
 
     init(restorationURL: URL = StorageManager.recoveryDirectory.appendingPathComponent("Recovery-\(UUID().uuidString).paperdesk")) {
         window = EditorWindow(contentRect: CGRect(x: 0, y: 0, width: 1320, height: 880), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
@@ -160,7 +165,7 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
         pageScroll.widthAnchor.constraint(equalToConstant: 142).isActive = true
         pageScroll.heightAnchor.constraint(greaterThanOrEqualToConstant: 100).isActive = true
         pageScroll.setContentHuggingPriority(.defaultLow, for: .vertical)
-        let help = NSTextField(wrappingLabelWithString: "A4 · 210 × 297 mm\n\n双击：编辑文字\n拖拽：移动对象\n右下角：缩放\nShift：多选 / 自由缩放\n方向键：微调位置\n平移 / 空格拖拽：移动视图\nShift + 滚轮：左右移动")
+        let help = NSTextField(wrappingLabelWithString: "A4 · 210 × 297 mm\n\n双击：编辑文字\n拖拽：移动对象\n文字四边 / 四角：缩放\n图片右下角：缩放\nShift：多选 / 自由缩放\n方向键：微调位置\n平移 / 空格拖拽：移动视图\nShift + 滚轮：左右移动")
         help.font = .systemFont(ofSize: 11); help.textColor = .secondaryLabelColor
         sidebar.addArrangedSubview(help)
         body.addArrangedSubview(sidebar)
@@ -215,6 +220,10 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
         }
         ratioCheck.state = .on; addInspector(ratioCheck)
         addInspector(row([button("置顶", #selector(bringFront)), button("置底", #selector(sendBack)), button("删除", #selector(deleteSelection))], spacing: 5))
+        let duplicate = button("复制一份", #selector(duplicateSelection))
+        contextualButtons.append(duplicate)
+        let fitText = button("适应文字高度", #selector(fitTextHeight))
+        addInspector(row([duplicate, fitText], spacing: 5))
         addInspector(divider())
         addInspector(label("文字格式", size: 11, weight: .medium))
         for (name, font) in [("苹方", "PingFangSC-Regular"), ("宋体", "SongtiSC-Regular"), ("黑体", "STHeitiSC-Light"), ("Times New Roman", "TimesNewRomanPSMT"), ("Menlo", "Menlo-Regular")] {
@@ -226,7 +235,9 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
         fontSizeField.widthAnchor.constraint(equalToConstant: 58).isActive = true
         let bold = button("B", #selector(toggleBold)); bold.font = .boldSystemFont(ofSize: 13)
         let italic = button("I", #selector(toggleItalic)); let underline = button("U", #selector(toggleUnderline))
-        bold.toolTip = "加粗"; italic.toolTip = "斜体"; underline.toolTip = "下划线"
+        styleButtons = [bold, italic, underline]
+        styleButtons.forEach { $0.setButtonType(.toggle); $0.allowsMixedState = true }
+        bold.toolTip = "加粗 · ⌘B"; italic.toolTip = "斜体 · ⌘I"; underline.toolTip = "下划线 · ⌘U"
         fontSizeField.setAccessibilityLabel("字号（点）")
         fontSizeField.toolTip = "字号 4～200 pt；按 Return 应用"
         addInspector(row([fontSizeField, label("pt", size: 10), bold, italic, underline], spacing: 3))
@@ -236,7 +247,7 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
         linePicker.target = self; linePicker.action = #selector(applyLineHeight)
         colorWell.color = .black; colorWell.target = self; colorWell.action = #selector(applyColor)
         colorWell.widthAnchor.constraint(equalToConstant: 42).isActive = true
-        textControls = [fontPicker, fontSizeField, bold, italic, underline, alignment, linePicker, colorWell]
+        textControls = [fontPicker, fontSizeField, bold, italic, underline, alignment, linePicker, colorWell, fitText]
         addInspector(row([label("行距", size: 11), linePicker, spacer(), colorWell]))
         addInspector(divider())
         gapSlider.target = self; gapSlider.action = #selector(changeGap)
@@ -276,7 +287,12 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
         let undoButton = button("撤销", #selector(undoAction), symbol: "arrow.uturn.backward")
         let redoButton = button("重做", #selector(redoAction), symbol: "arrow.uturn.forward")
         undoButton.toolTip = "撤销 · ⌘Z"; redoButton.toolTip = "重做 · ⇧⌘Z"
-        let bottom = row([undoButton, redoButton, taskIndicator, statusLabel, spacer(), button("存储空间", #selector(showStorage), symbol: "internaldrive"), label("本机处理", size: 10)])
+        locateOverflowButton.target = self; locateOverflowButton.action = #selector(locateOverflow)
+        locateOverflowButton.bezelStyle = .rounded; locateOverflowButton.isHidden = true
+        locateOverflowButton.toolTip = "选中第一个装不下文字的文本框，可用“适应文字高度”处理。"
+        outputButton.target = self; outputButton.action = #selector(revealLastOutput)
+        outputButton.bezelStyle = .rounded; outputButton.isHidden = true
+        let bottom = row([undoButton, redoButton, taskIndicator, statusLabel, locateOverflowButton, outputButton, spacer(), button("存储空间", #selector(showStorage), symbol: "internaldrive"), label("本机处理", size: 10)])
         bottom.edgeInsets = NSEdgeInsets(top: 7, left: 16, bottom: 7, right: 16)
         outer.addArrangedSubview(bottom); bottom.widthAnchor.constraint(equalTo: outer.widthAnchor).isActive = true
     }
@@ -286,6 +302,7 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
         canvas.onSelection = { [weak self] in self?.refreshSelection() }
         canvas.onDropImages = { [weak self] urls, page, point in self?.insertImages(urls, page: page, at: point) }
         canvas.onNewText = { [weak self] page, point in self?.insertText(page: page, at: point) }
+        canvas.onDuplicate = { [weak self] in self?.duplicateSelection() }
         canvas.onDelete = { [weak self] in self?.deleteSelection() }
     }
     func createMenu() {
@@ -305,6 +322,7 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
         let redo = NSMenuItem(title: "重做", action: #selector(redoAction), keyEquivalent: "z"); redo.keyEquivalentModifierMask = [.command, .shift]; redo.target = self; edit.addItem(redo)
         edit.addItem(.separator())
         for item in [("剪切", #selector(NSText.cut(_:)), "x"), ("复制", #selector(NSText.copy(_:)), "c"), ("粘贴", #selector(NSText.paste(_:)), "v"), ("全选", #selector(NSText.selectAll(_:)), "a")] { edit.addItem(withTitle: item.0, action: item.1, keyEquivalent: item.2) }
+        submenu("格式", [("加粗", #selector(toggleBold), "b", .command), ("斜体", #selector(toggleItalic), "i", .command), ("下划线", #selector(toggleUnderline), "u", .command), ("适应文字高度", #selector(fitTextHeight), "", []), ("定位文字溢出", #selector(locateOverflow), "", []), ("复制所选对象", #selector(duplicateSelection), "d", .command)])
         submenu("插入", [("文字框", #selector(addText), "t", [.command, .shift]), ("图片…", #selector(addImages), "i", [.command, .shift]), ("A4 页面", #selector(addPage), "p", [.command, .shift])])
         submenu("视图", [("放大", #selector(zoomIn), "+", .command), ("缩小", #selector(zoomOut), "-", .command), ("适合宽度", #selector(fitWidth), "0", .command)])
         submenu("窗口", [("下一个标签", #selector(nextTab), "\t", .control), ("上一个标签", #selector(previousTab), "\t", [.control, .shift]), ("将当前标签移到独立窗口", #selector(detachTab), "", [])])
@@ -342,13 +360,10 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
             pageSignature = signature
             for view in pageList.arrangedSubviews { pageList.removeArrangedSubview(view); view.removeFromSuperview() }
             for (index, page) in canvas.document.pages.enumerated() {
-                let entry = button("\(index == canvas.activePage ? "●" : "○")  第 \(index + 1) 页   ·   \(page.elements.count)", #selector(selectPage))
-                entry.setButtonType(.toggle); entry.state = index == canvas.activePage ? .on : .off
-                if index == canvas.activePage {
-                    entry.bezelColor = NSColor(srgbRed: 0.86, green: 0.94, blue: 0.96, alpha: 1)
-                    entry.contentTintColor = .labelColor
-                    entry.attributedTitle = NSAttributedString(string: entry.title, attributes: [.font: NSFont.systemFont(ofSize: 12, weight: .semibold), .foregroundColor: NSColor.labelColor])
-                }
+                let entry = PageNavigationButton(title: "\(index == canvas.activePage ? "●" : "○")  第 \(index + 1) 页   ·   \(page.elements.count)", target: self, action: #selector(selectPage))
+                entry.bezelStyle = .rounded; entry.font = .systemFont(ofSize: 12)
+                entry.setButtonType(.momentaryPushIn); entry.isCurrentPage = index == canvas.activePage
+                entry.setAccessibilityLabel("第 \(index + 1) 页，\(page.elements.count) 个对象\(index == canvas.activePage ? "，当前页" : "")")
                 entry.toolTip = "第 \(index + 1) 页，\(page.elements.count) 个对象"
                 entry.tag = index; entry.widthAnchor.constraint(equalToConstant: 138).isActive = true
                 pageList.addArrangedSubview(entry)
@@ -356,6 +371,8 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
         }
         let objects = canvas.document.pages.flatMap(\.elements)
         let overflows = canvas.overflowCount
+        locateOverflowButton.isHidden = overflows == 0
+        locateOverflowButton.isEnabled = !exporting && overflows > 0
         statusLabel.stringValue = overflows > 0 ? "⚠ \(overflows) 个文本框文字溢出：请加高、缩小字号或拆到新页。" : "第 \(canvas.activePage + 1) / \(canvas.document.pages.count) 页 · \(objects.count) 个对象 · \(dirty ? "未保存（每 5 秒自动恢复备份）" : "已保存")"
         statusLabel.textColor = overflows > 0 ? .systemRed : .secondaryLabelColor
         if let taskName { statusLabel.stringValue = taskName + "… 可切换其他标签"; statusLabel.textColor = .secondaryLabelColor }
@@ -364,11 +381,7 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
         if let item = canvas.selectedElement {
             selectionLabel.stringValue = item.kind == .text ? "文字框 · 双击进入编辑，Esc 结束" : "图片 · 拖右下角等比缩放"
             for (field, value) in zip(geometry, [item.x, item.y, item.width, item.height]) { field.stringValue = String(format: "%.1f", value * 25.4 / 72); field.isEnabled = true }
-            if item.kind == .text, item.attributedText.length > 0 {
-                let attrs = item.attributedText.attributes(at: 0, effectiveRange: nil)
-                if let font = attrs[.font] as? NSFont { fontSizeField.stringValue = String(format: "%.0f", font.pointSize) }
-                if let color = attrs[.foregroundColor] as? NSColor { colorWell.color = color }
-            }
+            if item.kind == .text { refreshTextInspector() }
         } else {
             selectionLabel.stringValue = canvas.selectedIDs.isEmpty ? "双击纸面添加文字，或拖入图片。" : "已选择 \(canvas.selectedIDs.count) 个对象"
             geometry.forEach { $0.isEnabled = false }
@@ -392,7 +405,7 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
     }
     func withError(_ action: () throws -> Void) { do { try action() } catch { showError(error) } }
     @objc func about() {
-        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.3.0"
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.4.0"
         let alert = PaperDeskAppearance.alert(); alert.messageText = "PaperDesk \(version)"; alert.informativeText = "面向作业的本地 A4 图文排版工具。\n\n工程保存完整编辑状态；PDF 固定版式；DOCX 和 Markdown 按内容阅读顺序导出。\n\n首版采用可自由摆放的文字框，文字不会自动流到下一页。"; alert.beginSheetModal(for: window)
     }
     @objc func quit() { NSApp.terminate(nil) }
@@ -432,6 +445,7 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
     func insertText(page: Int, at point: CGPoint) {
         guard !exporting, canvas.document.pages.indices.contains(page), point.x.isFinite, point.y.isFinite else { return }
         guard canvas.document.pages[page].elements.count < 2000 else { showError(DeskError.message("本页对象过多，请添加新页。")); return }
+        let insertionAttributes = newTextAttributes()
         canvas.finishEditing(); checkpoint()
         let x = max(0, min(point.x, paperWidth - 100)), y = max(0, min(point.y, paperHeight - 80))
         let area = canvas.document.contentRect
@@ -441,9 +455,8 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
         canvas.document.pages[page].elements.append(item); canvas.activePage = page; canvas.selectedIDs = [item.id]
         didChange(); canvas.startEditing(item.id)
         canvas.scrollToVisible(CGRect(x: canvas.pageRect(page).minX + x * canvas.zoom, y: canvas.pageRect(page).minY + y * canvas.zoom, width: 100 * canvas.zoom, height: 40 * canvas.zoom))
-        let typedSize = Double(fontSizeField.stringValue) ?? 14
-        let safeSize = typedSize.isFinite && (4...200).contains(typedSize) ? typedSize : 14
-        canvas.textEditor?.typingAttributes = TextStyle.make(" ", size: CGFloat(safeSize)).attributes(at: 0, effectiveRange: nil)
+        canvas.textEditor?.typingAttributes = insertionAttributes
+        refreshSelection()
     }
     @objc func addImages() {
         let panel = NSOpenPanel(); panel.allowsMultipleSelection = true; panel.allowedContentTypes = [.image]; panel.canChooseDirectories = false
@@ -550,16 +563,22 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
     }
     @objc func toggleMargins(_ sender: NSButton) { canvas.showMargins = sender.state == .on; canvas.needsDisplay = true }
 
-    func editText(_ transform: (NSMutableAttributedString, NSRange) -> Void) {
-        guard let item = canvas.selectedElement, item.kind == .text else { return }
+    func editText(paragraph: Bool = false, _ transform: (NSMutableAttributedString, NSRange) -> Void) {
+        guard !exporting, let item = canvas.selectedElement, item.kind == .text else { return }
         if let editor = canvas.textEditor, let storage = editor.textStorage {
+            guard !editor.hasMarkedText() else { return }
             var range = editor.selectedRange()
-            if range.length == 0 && storage.length > 0 { range = NSRange(location: 0, length: storage.length) }
-            if storage.length == 0 {
+            if paragraph, storage.length > 0 { range = (storage.string as NSString).paragraphRange(for: range) }
+            if range.length == 0 {
                 let sample = NSMutableAttributedString(string: " ", attributes: editor.typingAttributes)
                 transform(sample, NSRange(location: 0, length: 1)); editor.typingAttributes = sample.attributes(at: 0, effectiveRange: nil)
-            } else if editor.shouldChangeText(in: range, replacementString: nil) {
-                storage.beginEditing(); transform(storage, range); storage.endEditing(); editor.didChangeText()
+            } else {
+                let formatted = NSMutableAttributedString(attributedString: storage)
+                transform(formatted, range)
+                if !formatted.isEqual(to: storage) {
+                    canvas.prepareTextMutation()
+                    editor.applyFormatting(formatted, selection: editor.selectedRange())
+                }
             }
             window.makeFirstResponder(editor)
         } else {
@@ -572,8 +591,14 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
         refreshSelection()
     }
     @objc func applyFont() {
-        let name = fontPicker.selectedItem?.representedObject as? String ?? "PingFangSC-Regular"
-        editText { text, range in text.enumerateAttribute(.font, in: range) { value, subrange, _ in let size = (value as? NSFont)?.pointSize ?? 14; text.addAttribute(.font, value: NSFont(name: name, size: size) ?? NSFont.systemFont(ofSize: size), range: subrange) } }
+        guard let name = fontPicker.selectedItem?.representedObject as? String else { return }
+        editText { text, range in text.enumerateAttribute(.font, in: range) { value, subrange, _ in
+            let old = value as? NSFont ?? .systemFont(ofSize: 14)
+            var font = NSFont(name: name, size: old.pointSize) ?? NSFont.systemFont(ofSize: old.pointSize)
+            let traits = NSFontManager.shared.traits(of: old).intersection([.boldFontMask, .italicFontMask])
+            if !traits.isEmpty { font = NSFontManager.shared.convert(font, toHaveTrait: traits) }
+            text.addAttribute(.font, value: font, range: subrange)
+        } }
     }
     @objc func applyFontSize() {
         guard let size = Double(fontSizeField.stringValue), size.isFinite, (4...200).contains(size) else { refreshSelection(); return }
@@ -584,13 +609,20 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
     func toggleTrait(_ trait: NSFontTraitMask) {
         editText { text, range in
             guard range.length > 0 else { return }
-            let first = text.attribute(.font, at: range.location, effectiveRange: nil) as? NSFont ?? .systemFont(ofSize: 14)
-            let remove = NSFontManager.shared.traits(of: first).contains(trait)
+            var remove = true
+            text.enumerateAttribute(.font, in: range) { value, _, _ in
+                if !NSFontManager.shared.traits(of: value as? NSFont ?? .systemFont(ofSize: 14)).contains(trait) { remove = false }
+            }
             text.enumerateAttribute(.font, in: range) { value, subrange, _ in let font = value as? NSFont ?? .systemFont(ofSize: 14); text.addAttribute(.font, value: remove ? NSFontManager.shared.convert(font, toNotHaveTrait: trait) : NSFontManager.shared.convert(font, toHaveTrait: trait), range: subrange) }
         }
     }
     @objc func toggleUnderline() {
-        editText { text, range in guard range.length > 0 else { return }; let current = text.attribute(.underlineStyle, at: range.location, effectiveRange: nil) as? Int ?? 0; text.addAttribute(.underlineStyle, value: current == 0 ? NSUnderlineStyle.single.rawValue : 0, range: range) }
+        editText { text, range in
+            guard range.length > 0 else { return }
+            var allUnderlined = true
+            text.enumerateAttribute(.underlineStyle, in: range) { value, _, _ in if (value as? Int ?? 0) == 0 { allUnderlined = false } }
+            text.addAttribute(.underlineStyle, value: allUnderlined ? 0 : NSUnderlineStyle.single.rawValue, range: range)
+        }
     }
     @objc func applyAlignment() {
         let values: [NSTextAlignment] = [.left, .center, .right, .justified]
@@ -599,7 +631,7 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
     }
     @objc func applyLineHeight() { let multiple = Double(linePicker.titleOfSelectedItem ?? "1.25") ?? 1.25; editParagraph { $0.lineHeightMultiple = multiple; $0.lineSpacing = 0 } }
     func editParagraph(_ transform: (NSMutableParagraphStyle) -> Void) {
-        editText { text, range in
+        editText(paragraph: true) { text, range in
             let paragraphs = (text.string as NSString).paragraphRange(for: range)
             text.enumerateAttribute(.paragraphStyle, in: paragraphs) { value, subrange, _ in
                 let style = (value as? NSParagraphStyle)?.mutableCopy() as? NSMutableParagraphStyle ?? NSMutableParagraphStyle()
@@ -609,15 +641,25 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
     }
     @objc func applyColor() { let color = colorWell.color; editText { $0.addAttribute(.foregroundColor, value: color, range: $1) } }
     @objc func undoAction() {
-        if let editor = window.firstResponder as? NSTextView, editor.undoManager?.canUndo == true { editor.undoManager?.undo(); return }
+        guard !exporting, canvas.textEditor?.hasMarkedText() != true else { return }
+        if let field = window.firstResponder as? NSTextView, field !== canvas.textEditor, field.isFieldEditor {
+            if field.undoManager?.canUndo == true { field.undoManager?.undo() }; return
+        }
+        if let editor = canvas.textEditor, editor.undoManager?.canUndo == true { editor.undoManager?.undo(); refreshSelection(); return }
         canvas.finishEditing()
+        while undoStack.last == canvas.document { undoStack.removeLast() }
         guard let previous = undoStack.popLast() else { return }
         redoStack.append(canvas.document); canvas.document = previous; canvas.selectedIDs = []; canvas.activePage = min(canvas.activePage, previous.pages.count - 1)
         canvas.invalidateImages(); didChange(); refreshSelection()
     }
     @objc func redoAction() {
-        if let editor = window.firstResponder as? NSTextView, editor.undoManager?.canRedo == true { editor.undoManager?.redo(); return }
+        guard !exporting, canvas.textEditor?.hasMarkedText() != true else { return }
+        if let field = window.firstResponder as? NSTextView, field !== canvas.textEditor, field.isFieldEditor {
+            if field.undoManager?.canRedo == true { field.undoManager?.redo() }; return
+        }
+        if let editor = canvas.textEditor, editor.undoManager?.canRedo == true { editor.undoManager?.redo(); refreshSelection(); return }
         canvas.finishEditing()
+        while redoStack.last == canvas.document { redoStack.removeLast() }
         guard let next = redoStack.popLast() else { return }
         undoStack.append(canvas.document); canvas.document = next; canvas.selectedIDs = []; canvas.activePage = min(canvas.activePage, next.pages.count - 1)
         canvas.invalidateImages(); didChange(); refreshSelection()
@@ -674,6 +716,7 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
     func openURL(_ url: URL) { openDocuments([url]) }
     func load(_ doc: PaperDocument, url: URL?, imported: Bool) {
         canvas.finishEditing(); canvas.document = doc; canvas.activePage = 0; canvas.selectedIDs = []; currentURL = url
+        fileExperience = DocumentFileExperience(sourceURL: url); lastOutputURL = nil; outputButton.isHidden = true
         undoStack.removeAll(); redoStack.removeAll(); savedDocument = imported ? PaperDocument() : doc
         window.contentView?.layoutSubtreeIfNeeded()
         canvas.invalidateImages(); didChange(); refreshSelection()
@@ -687,14 +730,8 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
         canvas.finishEditing()
         var destination = currentURL
         if forceChoose || destination == nil {
-            let panel = NSSavePanel(); panel.allowedContentTypes = [UTType(filenameExtension: "paperdesk") ?? .data]; panel.nameFieldStringValue = canvas.document.title + ".paperdesk"
-            if forceChoose {
-                panel.title = "工程另存为"
-                panel.nameFieldStringValue = canvas.document.title + "-副本.paperdesk"
-            }
-            panel.directoryURL = currentURL?.deletingLastPathComponent()
-            panel.message = "工程保留所有文字、图片原件、裁剪与位置，下次可继续编辑。"
-            guard panel.runModal() == .OK, let url = panel.url else { return }; destination = url
+            guard let url = chooseFileDestination(ext: "paperdesk", message: "工程保留所有文字、图片原件、裁剪与位置，下次可继续编辑。", isSaveAs: forceChoose) else { return }
+            destination = url
         }
         guard let url = destination else { return }
         saveAsynchronously(to: url, completion: completion)
@@ -709,24 +746,25 @@ final class EditorController: NSObject, NSWindowDelegate, NSMenuItemValidation {
         if window.isKeyWindow { createMenu() }
     }
     func chooseExport(ext: String, message: String) -> URL? {
-        canvas.finishEditing()
-        let panel = NSSavePanel(); panel.allowedContentTypes = [UTType(filenameExtension: ext) ?? .data]; panel.nameFieldStringValue = canvas.document.title + "." + ext; panel.message = message
-        return panel.runModal() == .OK ? panel.url : nil
+        chooseFileDestination(ext: ext, message: message)
     }
     @objc func exportPDF() {
-        guard let url = chooseExport(ext: "pdf", message: "按 A4 原尺寸导出全部页面，保留画布上的图文位置。") else { return }
+        guard let request = choosePDFExport() else { return }
+        guard !focusFirstOverflow(in: request.pageIndices) else {
+            showError(DeskError.message("已定位所选页面中溢出的文本框。请先适应文字高度、加宽、缩小字号或拆页，然后重新导出。")); return
+        }
         let snapshot = canvas.document
-        runTask("正在导出 PDF", work: { try PDFExporter.write(snapshot, to: url) }, completion: { [weak self] in self?.statusLabel.stringValue = "已导出 PDF：\(url.lastPathComponent)" })
+        exportAsynchronously(to: request.url, kind: "PDF（\(request.pageIndices.count) 页）", work: { try PDFExporter.write(snapshot, to: request.url, pageIndices: request.pageIndices) })
     }
     @objc func exportDOCX() {
         guard let url = chooseExport(ext: "docx", message: "导出可编辑文字和图片，按页面阅读顺序排列；自由摆放坐标不保留。") else { return }
         let snapshot = canvas.document
-        runTask("正在导出 DOCX", work: { try DocumentConversion.exportDOCX(snapshot, to: url) }, completion: { [weak self] in self?.statusLabel.stringValue = "已导出 DOCX：\(url.lastPathComponent)" })
+        exportAsynchronously(to: url, kind: "DOCX", work: { try DocumentConversion.exportDOCX(snapshot, to: url) })
     }
     @objc func exportMarkdown() {
         guard let url = chooseExport(ext: "md", message: "导出文字和图片链接，不保留 A4 坐标、字体或分页。图片保存在旁边的资源文件夹。") else { return }
         let snapshot = canvas.document
-        runTask("正在导出 Markdown", work: { try DocumentConversion.exportMarkdown(snapshot, to: url) }, completion: { [weak self] in self?.statusLabel.stringValue = "已导出 Markdown 与图片资源。" })
+        exportAsynchronously(to: url, kind: "Markdown 与图片资源", work: { try DocumentConversion.exportMarkdown(snapshot, to: url) })
     }
     func writeRecovery() {
         guard dirty, !recoveryPending, !exporting, !isClosed else { return }

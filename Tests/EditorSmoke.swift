@@ -36,6 +36,9 @@ import AppKit
         try testCanvasNavigation()
         try testWorkspace()
         try testEditorReliability()
+        try testFileExperience()
+        try testTextFormatting()
+        try testTextBoxInteraction()
         let context = CGContext(data: nil, width: 192, height: 128, bitsPerComponent: 8, bytesPerRow: 192 * 4, space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
         for (i, color) in [NSColor.systemTeal, .systemOrange, .systemBlue, .systemYellow].enumerated() {
             context.setFillColor(color.cgColor)

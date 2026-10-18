@@ -48,8 +48,20 @@ extension EditorController {
         if exporting {
             return [#selector(quit), #selector(newDocument), #selector(newWindow), #selector(nextTab), #selector(previousTab), #selector(closeDocument)].contains(menuItem.action)
         }
-        if menuItem.action == #selector(undoAction) { return !undoStack.isEmpty || (window.firstResponder as? NSTextView)?.undoManager?.canUndo == true }
-        if menuItem.action == #selector(redoAction) { return !redoStack.isEmpty || (window.firstResponder as? NSTextView)?.undoManager?.canRedo == true }
+        if menuItem.action == #selector(undoAction) || menuItem.action == #selector(redoAction) {
+            let undo = menuItem.action == #selector(undoAction)
+            if canvas.textEditor?.hasMarkedText() == true { return false }
+            if let field = window.firstResponder as? NSTextView, field !== canvas.textEditor, field.isFieldEditor {
+                return undo ? field.undoManager?.canUndo == true : field.undoManager?.canRedo == true
+            }
+            let textUndo = undo ? canvas.textEditor?.undoManager?.canUndo : canvas.textEditor?.undoManager?.canRedo
+            return textUndo == true || (undo ? !undoStack.isEmpty : !redoStack.isEmpty)
+        }
+        if [#selector(toggleBold), #selector(toggleItalic), #selector(toggleUnderline), #selector(fitTextHeight)].contains(menuItem.action) {
+            return canvas.selectedElement?.kind == .text && canvas.textEditor?.hasMarkedText() != true
+        }
+        if menuItem.action == #selector(duplicateSelection) { return !canvas.selectedIDs.isEmpty && canvas.textEditor?.hasMarkedText() != true }
+        if menuItem.action == #selector(locateOverflow) { return canvas.document.pages.flatMap(\.elements).contains { canvas.overflows($0) } }
         return true
     }
 
@@ -84,8 +96,12 @@ extension EditorController {
                             existing.window.makeKeyAndOrderFront(nil); anchor = existing
                         } else {
                             anchor = workspace.create(document: doc, url: native ? url : nil, imported: !native, tabbedWith: anchor)
+                            anchor.fileExperience.sourceURL = url
                         }
-                    } else { self.load(doc, url: native ? url : nil, imported: !native) }
+                    } else {
+                        self.load(doc, url: native ? url : nil, imported: !native)
+                        self.fileExperience.sourceURL = url
+                    }
                 case .failure(let error): failures.append("\(url.lastPathComponent)：\(error.localizedDescription)")
                 }
             }
@@ -113,7 +129,7 @@ extension EditorController {
                 self.canvas.document = document; self.savedDocument = document; self.currentURL = url
                 self.dirty = false; self.window.isDocumentEdited = false
                 self.removeRecovery(); self.refresh()
-                self.statusLabel.stringValue = "已保存：\(url.lastPathComponent)"
+                self.recordOutput(to: url, message: "已保存：\(url.lastPathComponent)")
                 completion?()
             case .failure(let error): self.showError(error)
             }

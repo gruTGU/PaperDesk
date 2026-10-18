@@ -2,9 +2,64 @@ import AppKit
 
 final class CanvasTextView: NSTextView {
     var onFinish: (() -> Void)?
+    // Undo actions retain their text-system targets. Keep each editing session isolated
+    // from other text boxes and discard those actions before releasing the editor.
+    private let sessionUndoManager = UndoManager()
+    override var undoManager: UndoManager? { sessionUndoManager }
+    /// Attribute edits made directly on NSTextStorage bypass NSTextView's native
+    /// typing undo. Register complete rich-text values so mixed runs and selections
+    /// round-trip through Undo/Redo instead of falling back to the project snapshot.
+    @discardableResult func applyFormatting(_ value: NSAttributedString, selection: NSRange) -> Bool {
+        let old = attributedString()
+        let previousSelection = selectedRange()
+        guard !hasMarkedText(), !old.isEqual(to: value) else { return false }
+        let previous = NSAttributedString(attributedString: old)
+        breakUndoCoalescing()
+        // shouldChangeText may register its own whole-range undo. Suppress that
+        // duplicate while this explicit attributed-text operation owns the inverse.
+        let manager = undoManager
+        manager?.disableUndoRegistration()
+        let allowed = shouldChangeText(in: NSRange(location: 0, length: old.length), replacementString: nil)
+        if allowed {
+            textStorage?.setAttributedString(value)
+            let location = min(max(0, selection.location), value.length)
+            setSelectedRange(NSRange(location: location, length: min(max(0, selection.length), value.length - location)))
+            didChangeText()
+        }
+        manager?.enableUndoRegistration()
+        guard allowed else { return false }
+        // Native event groups normally exist here. An explicit undo/redo invoked
+        // in the same event can close them; create a group rather than registering
+        // against an invalid zero-level manager (which raises an Obj-C exception).
+        let needsGroup = manager?.groupingLevel == 0 && manager?.isUndoing != true && manager?.isRedoing != true
+        if needsGroup { manager?.beginUndoGrouping() }
+        manager?.registerUndo(withTarget: self) { target in
+            target.applyFormatting(previous, selection: previousSelection)
+        }
+        manager?.setActionName("文字格式")
+        if needsGroup { manager?.endUndoGrouping() }
+        return true
+    }
     override func keyDown(with event: NSEvent) {
-        if event.keyCode == 53 { onFinish?(); return }
+        if event.keyCode == 53 && !hasMarkedText() { onFinish?(); return }
         super.keyDown(with: event)
+    }
+}
+
+enum CanvasResizeHandle: CaseIterable {
+    case topLeft, top, topRight, left, right, bottomLeft, bottom, bottomRight
+    var movesLeft: Bool { self == .topLeft || self == .left || self == .bottomLeft }
+    var movesRight: Bool { self == .topRight || self == .right || self == .bottomRight }
+    var movesTop: Bool { self == .topLeft || self == .top || self == .topRight }
+    var movesBottom: Bool { self == .bottomLeft || self == .bottom || self == .bottomRight }
+    func point(in rect: CGRect) -> CGPoint {
+        CGPoint(x: movesLeft ? rect.minX : (movesRight ? rect.maxX : rect.midX),
+                y: movesTop ? rect.minY : (movesBottom ? rect.maxY : rect.midY))
+    }
+    var cursor: NSCursor {
+        if self == .left || self == .right { return .resizeLeftRight }
+        if self == .top || self == .bottom { return .resizeUpDown }
+        return .crosshair
     }
 }
 
@@ -46,8 +101,15 @@ final class CanvasView: NSView, NSTextViewDelegate {
     var onDropImages: (([URL], Int, CGPoint) -> Void)?
     var onNewText: ((Int, CGPoint) -> Void)?
     var onDelete: (() -> Void)?
+    var onDuplicate: (() -> Void)?
     var textEditor: CanvasTextView?
     var editingID: UUID?
+    private var editingOriginalText: NSAttributedString?
+    private var editingOriginalRTF: Data?
+    private var lastCommittedText: NSAttributedString?
+    private var hasEditingCheckpoint = false
+    private var isPreparingTextCheckpoint = false
+    private var isFinishingEditing = false
     var showMargins = true
     var isPanningMode = false {
         didSet { updatePanCursor() }
@@ -78,9 +140,8 @@ final class CanvasView: NSView, NSTextViewDelegate {
     private var dragElements: [PaperElement] = []
     private var dragSourcePage = 0
     private var dragSourcePageID: UUID?
-    private var dragResize = false
+    private var dragHandle: CanvasResizeHandle?
     private var didDrag = false
-    private var startingRect = CGRect.zero
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
 
@@ -145,12 +206,37 @@ final class CanvasView: NSView, NSTextViewDelegate {
     }
     override func resetCursorRects() {
         super.resetCursorRects()
-        if isPanActive { addCursorRect(visibleRect, cursor: panDragLocation == nil ? .openHand : .closedHand) }
+        if isPanActive { addCursorRect(visibleRect, cursor: panDragLocation == nil ? .openHand : .closedHand); return }
+        guard isInteractionEnabled, selectedIDs.count == 1 else { return }
+        for (pageIndex, page) in document.pages.enumerated() {
+            guard let item = page.elements.first(where: { selectedIDs.contains($0.id) }) else { continue }
+            let pageFrame = pageRect(pageIndex)
+            for handle in resizeHandles(for: item) {
+                let point = handle.point(in: item.rect)
+                let frame = CGRect(x: pageFrame.minX + point.x * zoom - 6, y: pageFrame.minY + point.y * zoom - 6, width: 12, height: 12)
+                let clipped = frame.intersection(visibleRect)
+                if !clipped.isNull && !clipped.isEmpty && [clipped.minX, clipped.minY, clipped.width, clipped.height].allSatisfy({ $0.isFinite }) {
+                    addCursorRect(clipped, cursor: handle.cursor)
+                }
+            }
+        }
     }
     override func hitTest(_ point: NSPoint) -> NSView? {
         let hit = super.hitTest(point)
         // A hand drag may begin above an open text editor without changing its text.
-        return isPanActive && hit != nil ? self : hit
+        if isPanActive && hit != nil { return self }
+        // Leave the content to NSTextView, but keep the outline and handles available
+        // for moving/resizing a text box without requiring an extra Escape first.
+        if hit != nil, isInteractionEnabled, let id = editingID {
+            let canvasPoint = convert(point, from: superview)
+            for (pageIndex, page) in document.pages.enumerated() {
+                guard let item = page.elements.first(where: { $0.id == id }) else { continue }
+                let local = localPoint(canvasPoint, page: pageIndex)
+                if item.rect.insetBy(dx: -7 / zoom, dy: -7 / zoom).contains(local)
+                    && !item.rect.insetBy(dx: 5 / zoom, dy: 5 / zoom).contains(local) { return self }
+            }
+        }
+        return hit
     }
     override func resignFirstResponder() -> Bool {
         temporaryPan = false
@@ -289,11 +375,21 @@ final class CanvasView: NSView, NSTextViewDelegate {
                 NSColor.systemRed.setStroke()
                 let outline = NSBezierPath(rect: item.rect); outline.lineWidth = 1.5 / zoom; outline.stroke()
             }
-            for item in page.elements where selectedIDs.contains(item.id) && item.id != editingID {
+            for item in page.elements where selectedIDs.contains(item.id) {
                 NSColor.controlAccentColor.setStroke()
-                let outline = NSBezierPath(rect: item.rect); outline.lineWidth = 1.6 / zoom; outline.stroke()
-                let handle = CGRect(x: item.rect.maxX - 4 / zoom, y: item.rect.maxY - 4 / zoom, width: 8 / zoom, height: 8 / zoom)
-                NSColor.white.setFill(); handle.fill(); NSColor.controlAccentColor.setStroke(); NSBezierPath(rect: handle).stroke()
+                let isEditing = item.id == editingID
+                let outline = NSBezierPath(rect: isEditing ? item.rect.insetBy(dx: -2 / zoom, dy: -2 / zoom) : item.rect)
+                outline.lineWidth = 1.6 / zoom
+                if isEditing { outline.setLineDash([3 / zoom, 2 / zoom], count: 2, phase: 0) }
+                outline.stroke()
+                if selectedIDs.count == 1 {
+                    for direction in resizeHandles(for: item) {
+                        let point = direction.point(in: item.rect)
+                        let handle = CGRect(x: point.x - 4 / zoom, y: point.y - 4 / zoom, width: 8 / zoom, height: 8 / zoom)
+                        NSColor.white.setFill(); handle.fill(); NSColor.controlAccentColor.setStroke()
+                        let path = NSBezierPath(rect: handle); path.lineWidth = 1 / zoom; path.stroke()
+                    }
+                }
             }
             NSGraphicsContext.restoreGraphicsState()
             let label = "\(index + 1)  /  \(document.pages.count)   ·   A4"
@@ -302,6 +398,43 @@ final class CanvasView: NSView, NSTextViewDelegate {
         }
     }
 
+    func resizeHandles(for item: PaperElement) -> [CanvasResizeHandle] {
+        item.kind == .text ? CanvasResizeHandle.allCases : [.bottomRight]
+    }
+    func resizeHandle(at point: CGPoint, for item: PaperElement) -> CanvasResizeHandle? {
+        resizeHandles(for: item).first { handle in
+            let center = handle.point(in: item.rect)
+            return CGRect(x: center.x - 7 / zoom, y: center.y - 7 / zoom, width: 14 / zoom, height: 14 / zoom).contains(point)
+        }
+    }
+    /// The opposite edge remains fixed; all distances are in A4 points, independent
+    /// of the display zoom. Never allow a resize to invert or cross a page edge.
+    func resizedRect(_ original: CGRect, kind: ElementKind, handle: CanvasResizeHandle,
+                     delta: CGPoint, preserveAspect: Bool) -> CGRect {
+        guard [original.minX, original.minY, original.width, original.height, delta.x, delta.y].allSatisfy({ $0.isFinite }),
+              original.width > 0, original.height > 0 else { return original }
+        // Imported projects may contain objects extending beyond a sheet. Bring the
+        // starting box into a valid A4 extent before applying a bounded resize delta.
+        let original = CGRect(x: max(0, min(paperWidth - min(original.width, paperWidth), original.minX)),
+                              y: max(0, min(paperHeight - min(original.height, paperHeight), original.minY)),
+                              width: min(original.width, paperWidth), height: min(original.height, paperHeight))
+        let delta = CGPoint(x: max(-paperWidth, min(paperWidth, delta.x)), y: max(-paperHeight, min(paperHeight, delta.y)))
+        if kind == .image && handle == .bottomRight && preserveAspect {
+            let ratio = original.width / original.height
+            var width = max(24, original.width + delta.x)
+            var height = max(24, original.height + delta.y)
+            if abs(delta.x) >= abs(delta.y * ratio) { height = width / ratio } else { width = height * ratio }
+            let fit = min(1, min(max(0, paperWidth - original.minX) / width, max(0, paperHeight - original.minY) / height))
+            return CGRect(origin: original.origin, size: CGSize(width: max(1, width * fit), height: max(1, height * fit)))
+        }
+        var left = original.minX, right = original.maxX, top = original.minY, bottom = original.maxY
+        let minWidth = min(24, original.width), minHeight = min(24, original.height)
+        if handle.movesLeft { left = max(0, min(right - minWidth, left + delta.x)) }
+        if handle.movesRight { right = min(paperWidth, max(left + minWidth, right + delta.x)) }
+        if handle.movesTop { top = max(0, min(bottom - minHeight, top + delta.y)) }
+        if handle.movesBottom { bottom = min(paperHeight, max(top + minHeight, bottom + delta.y)) }
+        return CGRect(x: left, y: top, width: right - left, height: bottom - top)
+    }
     override func mouseDown(with event: NSEvent) {
         if isPanActive {
             window?.makeFirstResponder(self)
@@ -312,25 +445,43 @@ final class CanvasView: NSView, NSTextViewDelegate {
         }
         guard isInteractionEnabled else { return }
         cancelObjectDrag()
+        let previousEditingID = editingID
         finishEditing()
         window?.makeFirstResponder(self)
         let point = convert(event.locationInWindow, from: nil)
-        guard let page = pageIndex(at: point) else { selectedIDs = []; onSelection?(); needsDisplay = true; return }
+        var selectedHandle: (page: Int, item: PaperElement, handle: CanvasResizeHandle)?
+        if selectedIDs.count == 1 {
+            for (index, page) in document.pages.enumerated() {
+                if let item = page.elements.first(where: { selectedIDs.contains($0.id) }),
+                   let handle = resizeHandle(at: localPoint(point, page: index), for: item) {
+                    selectedHandle = (index, item, handle); break
+                }
+            }
+        }
+        guard let page = selectedHandle?.page ?? pageIndex(at: point) else { selectedIDs = []; onSelection?(); needsDisplay = true; return }
         activePage = page
         let local = localPoint(point, page: page)
         let elements = document.pages[page].elements
-        let handleHit = elements.reversed().first { selectedIDs.contains($0.id) && CGRect(x: $0.rect.maxX - 9 / zoom, y: $0.rect.maxY - 9 / zoom, width: 18 / zoom, height: 18 / zoom).contains(local) }
-        let hit = handleHit ?? elements.reversed().first { $0.rect.contains(local) }
+        let hit = selectedHandle?.item ?? elements.reversed().first {
+            ($0.id == previousEditingID ? $0.rect.insetBy(dx: -7 / zoom, dy: -7 / zoom) : $0.rect).contains(local)
+        }
         if let hit {
-            if event.modifierFlags.contains(.shift) {
+            if event.modifierFlags.contains(.shift) && selectedHandle == nil {
                 if selectedIDs.contains(hit.id) { selectedIDs.remove(hit.id) } else { selectedIDs.insert(hit.id) }
             } else if !selectedIDs.contains(hit.id) { selectedIDs = [hit.id] }
-            if event.clickCount == 2 && hit.kind == .text { selectedIDs = [hit.id]; startEditing(hit.id); return }
+            if event.clickCount == 2 && hit.kind == .text && selectedHandle == nil {
+                selectedIDs = [hit.id]; startEditing(hit.id)
+                if let editor = textEditor {
+                    let position = editor.characterIndexForInsertion(at: editor.convert(event.locationInWindow, from: nil))
+                    let range = editor.selectionRange(forProposedRange: NSRange(location: position, length: 0), granularity: .selectByWord)
+                    editor.setSelectedRange(range)
+                }
+                return
+            }
             dragStart = point
             dragSourcePage = page
             dragSourcePageID = document.pages[page].id
-            dragResize = handleHit != nil && selectedIDs.count == 1
-            startingRect = hit.rect
+            dragHandle = selectedHandle?.handle
             dragElements = elements.filter { selectedIDs.contains($0.id) }
             didDrag = false
         } else {
@@ -338,6 +489,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             dragElements = []
             if event.clickCount == 2 { onNewText?(page, local); return }
         }
+        window?.invalidateCursorRects(for: self)
         onSelection?(); needsDisplay = true
     }
     override func mouseDragged(with event: NSEvent) {
@@ -348,26 +500,22 @@ final class CanvasView: NSView, NSTextViewDelegate {
             return
         }
         guard isInteractionEnabled, hasValidObjectDrag else { cancelObjectDrag(); return }
-        if !didDrag { onWillChange?(); didDrag = true }
-        guard hasValidObjectDrag else { cancelObjectDrag(); return }
         let point = convert(event.locationInWindow, from: nil)
         let dx = (point.x - dragStart.x) / zoom
         let dy = (point.y - dragStart.y) / zoom
+        guard dx.isFinite, dy.isFinite else { return }
+        // Ignore hand tremor and prevent a mouse-down/up from creating undo entries.
+        if !didDrag && hypot(point.x - dragStart.x, point.y - dragStart.y) < 2 { return }
+        if !didDrag { onWillChange?(); didDrag = true }
+        guard hasValidObjectDrag else { cancelObjectDrag(); return }
         for original in dragElements {
             guard let index = document.pages[dragSourcePage].elements.firstIndex(where: { $0.id == original.id }) else { continue }
-            var rect = original.rect
-            if dragResize {
-                var width = max(24, original.width + dx)
-                var height = max(24, original.height + dy)
-                if original.kind == .image && !event.modifierFlags.contains(.shift) {
-                    let ratio = original.width / original.height
-                    if abs(dx) >= abs(dy * ratio) { height = width / ratio } else { width = height * ratio }
-                    let fit = min(1, min((paperWidth - rect.minX) / width, (paperHeight - rect.minY) / height))
-                    width *= fit; height *= fit
-                }
-                rect.size = CGSize(width: max(12, min(width, paperWidth - rect.minX)), height: max(12, min(height, paperHeight - rect.minY)))
+            let rect: CGRect
+            if let handle = dragHandle {
+                rect = resizedRect(original.rect, kind: original.kind, handle: handle, delta: CGPoint(x: dx, y: dy),
+                                   preserveAspect: !event.modifierFlags.contains(.shift))
             } else {
-                rect.origin = CGPoint(x: original.x + dx, y: original.y + dy)
+                rect = original.rect.offsetBy(dx: dx, dy: dy)
             }
             document.pages[dragSourcePage].elements[index].rect = rect
         }
@@ -383,7 +531,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
         guard isInteractionEnabled, didDrag, hasValidObjectDrag else { cancelObjectDrag(); return }
         let point = convert(event.locationInWindow, from: nil)
         let targetPage = pageIndex(at: point) ?? dragSourcePage
-        if !dragResize && targetPage != dragSourcePage {
+        if dragHandle == nil && targetPage != dragSourcePage {
             let sourceRect = pageRect(dragSourcePage)
             let targetRect = pageRect(targetPage)
             let items = document.pages[dragSourcePage].elements.filter { selectedIDs.contains($0.id) }
@@ -409,7 +557,7 @@ final class CanvasView: NSView, NSTextViewDelegate {
             && dragElements.allSatisfy { original in selectedIDs.contains(original.id) && document.pages[dragSourcePage].elements.contains { $0.id == original.id } }
     }
     private func cancelObjectDrag() {
-        dragElements = []; didDrag = false; dragSourcePageID = nil
+        dragElements = []; didDrag = false; dragSourcePageID = nil; dragHandle = nil
     }
     func clamped(_ rect: CGRect) -> CGRect {
         CGRect(x: max(0, min(paperWidth - rect.width, rect.minX)), y: max(0, min(paperHeight - rect.height, rect.minY)), width: rect.width, height: rect.height)
@@ -421,8 +569,11 @@ final class CanvasView: NSView, NSTextViewDelegate {
             return
         }
         guard isInteractionEnabled else { return }
+        if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "d" {
+            onDuplicate?(); return
+        }
         if event.keyCode == 51 || event.keyCode == 117 { cancelObjectDrag(); onDelete?(); return }
-        if event.keyCode == 53 { selectedIDs = []; onSelection?(); needsDisplay = true; return }
+        if event.keyCode == 53 { cancelObjectDrag(); selectedIDs = []; onSelection?(); needsDisplay = true; return }
         let steps: [UInt16: CGPoint] = [123: CGPoint(x: -1, y: 0), 124: CGPoint(x: 1, y: 0), 125: CGPoint(x: 0, y: 1), 126: CGPoint(x: 0, y: -1)]
         if let direction = steps[event.keyCode], !selectedIDs.isEmpty {
             onWillChange?()
@@ -452,11 +603,14 @@ final class CanvasView: NSView, NSTextViewDelegate {
         cancelObjectDrag()
         finishEditing()
         guard let item = document.pages.flatMap(\.elements).first(where: { $0.id == id && $0.kind == .text }) else { return }
-        onWillChange?()
         editingID = id
         selectedIDs = [id]
-        let storage = NSTextStorage(attributedString: item.attributedText)
+        let originalText = item.attributedText
+        editingOriginalText = originalText; editingOriginalRTF = item.textRTF
+        lastCommittedText = originalText; hasEditingCheckpoint = false
+        let storage = NSTextStorage(attributedString: originalText)
         let manager = NSLayoutManager()
+        manager.backgroundLayoutEnabled = false
         let container = NSTextContainer(containerSize: CGSize(width: item.width, height: 100000))
         container.widthTracksTextView = false
         container.heightTracksTextView = false
@@ -471,7 +625,6 @@ final class CanvasView: NSView, NSTextViewDelegate {
         editor.isAutomaticLinkDetectionEnabled = false
         editor.drawsBackground = true
         editor.backgroundColor = .white
-        editor.textColor = .black
         editor.insertionPointColor = .controlAccentColor
         editor.textContainerInset = .zero
         editor.isVerticallyResizable = false
@@ -497,30 +650,59 @@ final class CanvasView: NSView, NSTextViewDelegate {
             }
         }
     }
-    func syncEditing() {
-        guard let id = editingID, let editor = textEditor else { return }
-        for p in document.pages.indices {
-            if let i = document.pages[p].elements.firstIndex(where: { $0.id == id }) {
-                document.pages[p].elements[i].setText(editor.attributedString())
-                break
-            }
+    /// Snapshot before the first committed mutation. Controller.checkpoint calls back
+    /// into syncEditing, so suppress that recursion until it has captured the old model.
+    func prepareTextMutation() {
+        guard editingID != nil, !hasEditingCheckpoint, !isPreparingTextCheckpoint else { return }
+        hasEditingCheckpoint = true
+        isPreparingTextCheckpoint = true
+        onWillChange?()
+        isPreparingTextCheckpoint = false
+    }
+    @discardableResult func syncEditing() -> Bool {
+        guard !isPreparingTextCheckpoint, let id = editingID, let editor = textEditor, !editor.hasMarkedText() else { return false }
+        let current = editor.attributedString()
+        if let last = lastCommittedText, current.isEqual(to: last) { return false }
+        guard let pageIndex = document.pages.firstIndex(where: { $0.elements.contains(where: { $0.id == id }) }),
+              let itemIndex = document.pages[pageIndex].elements.firstIndex(where: { $0.id == id }) else { return false }
+        prepareTextMutation()
+        // A callback may have replaced the document. Recheck IDs before writing.
+        guard document.pages.indices.contains(pageIndex), document.pages[pageIndex].elements.indices.contains(itemIndex),
+              document.pages[pageIndex].elements[itemIndex].id == id else { return false }
+        if let original = editingOriginalText, current.isEqual(to: original) {
+            document.pages[pageIndex].elements[itemIndex].textRTF = editingOriginalRTF
+        } else {
+            document.pages[pageIndex].elements[itemIndex].setText(current)
         }
+        lastCommittedText = NSAttributedString(attributedString: current)
+        return true
     }
     func finishEditing() {
-        guard textEditor != nil else { return }
-        syncEditing()
-        let editor = textEditor
-        editor?.delegate = nil
-        editor?.onFinish = nil
-        // AppKit may ask its first responder to close an undo group during a focus change.
-        // Keep the text view alive until that change has completed.
+        guard let editor = textEditor, !isFinishingEditing else { return }
+        isFinishingEditing = true
+        // Resigning first lets the input method finalize a candidate through AppKit.
+        // Never persist a still-marked composition as if it were committed text.
         if window?.firstResponder === editor { window?.makeFirstResponder(self) }
-        editor?.removeFromSuperview()
+        let changed = syncEditing()
+        editor.delegate = nil
+        editor.onFinish = nil
+        editor.inputContext?.discardMarkedText()
+        editor.undoManager?.removeAllActions()
+        editor.removeFromSuperview()
         textEditor = nil; editingID = nil
-        onChange?(); needsDisplay = true
+        editingOriginalText = nil; editingOriginalRTF = nil; lastCommittedText = nil
+        hasEditingCheckpoint = false; isFinishingEditing = false
+        if changed { onChange?() }
+        onSelection?(); needsDisplay = true
+        window?.invalidateCursorRects(for: self)
     }
     func textDidChange(_ notification: Notification) {
-        syncEditing(); onChange?(); needsDisplay = true
+        if syncEditing() { onChange?(); needsDisplay = true }
+        if textEditor?.hasMarkedText() != true { onSelection?() }
+    }
+    func textViewDidChangeSelection(_ notification: Notification) {
+        guard let editor = textEditor, notification.object as? NSTextView === editor, !editor.hasMarkedText() else { return }
+        onSelection?()
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation { isInteractionEnabled ? .copy : [] }

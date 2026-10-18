@@ -10,8 +10,8 @@ xcrun swiftc -swift-version 5 -module-cache-path "$CACHE_DIR" \
   "$PROJECT_DIR/Sources/ImageActions.swift" "$PROJECT_DIR/Sources/WorkspaceController.swift" \
   "$PROJECT_DIR/Sources/AppAppearance.swift" \
   "$PROJECT_DIR/Sources/StorageManager.swift" "$PROJECT_DIR/Tests/EditorSmoke.swift" \
-  "$PROJECT_DIR/Sources/DocumentTasks.swift" \
+  "$PROJECT_DIR/Sources/DocumentTasks.swift" "$PROJECT_DIR/Sources/FileExperience.swift" "$PROJECT_DIR/Sources/TextExperience.swift" \
   "$PROJECT_DIR/Tests/CanvasNavigationTests.swift" "$PROJECT_DIR/Tests/WorkspaceTests.swift" \
-  "$PROJECT_DIR/Tests/EditorReliabilityTests.swift" \
+  "$PROJECT_DIR/Tests/EditorReliabilityTests.swift" "$PROJECT_DIR/Tests/FileExperienceTests.swift" "$PROJECT_DIR/Tests/TextFormattingTests.swift" "$PROJECT_DIR/Tests/TextBoxInteractionTests.swift" \
   -o "$PROJECT_DIR/build/ui-tests"
 "$PROJECT_DIR/build/ui-tests" "$PROJECT_DIR/work/ui-test"

@@ -1,6 +1,16 @@
 import AppKit
 import UniformTypeIdentifiers
 
+extension ImageFormat {
+    var exportExtensions: Set<String> {
+        switch self {
+        case .png: return ["png"]
+        case .jpeg: return ["jpg", "jpeg"]
+        case .heic: return ["heic", "heif"]
+        }
+    }
+}
+
 final class CropPreviewView: NSView {
     let image: NSImage
     var selection: CropRect
@@ -120,6 +130,7 @@ extension EditorController {
     }
     @objc func exportPageImage() {
         canvas.finishEditing()
+        guard canvas.document.pages.indices.contains(canvas.activePage) else { return }
         let page = canvas.document.pages[canvas.activePage]
         let name = canvas.document.title + "-第\(canvas.activePage + 1)页"
         runTask("正在生成页面图片", work: { try PDFExporter.pageImage(page, scale: 2) }, completion: { [weak self] image in
@@ -127,11 +138,15 @@ extension EditorController {
         })
     }
     func presentImageExport(_ image: CGImage, suggestedName: String) {
+        guard !isClosed, workspace?.isTerminating != true else { return }
         guard !exporting else { showError(DeskError.message("正在处理上一张图片，请稍候。")); return }
         let formatPicker = NSPopUpButton(frame: CGRect(x: 0, y: 0, width: 270, height: 26))
         ImageFormat.allCases.forEach { formatPicker.addItem(withTitle: $0.title) }
         formatPicker.selectItem(at: 1)
         let limit = NSTextField(string: "0"); limit.frame = CGRect(x: 0, y: 0, width: 270, height: 24)
+        formatPicker.setAccessibilityLabel("图片保存格式")
+        limit.setAccessibilityLabel("图片大小上限，KB")
+        limit.toolTip = "1 KB = 1000 字节。0 为不限；无法满足上限时会提示，不会写入超出上限的文件。"
         let stack = NSStackView(views: [NSTextField(labelWithString: "保存格式"), formatPicker, NSTextField(labelWithString: "大小上限（KB，1 KB = 1000 字节；0 为不限）"), limit]); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 8
         formatPicker.widthAnchor.constraint(equalToConstant: 320).isActive = true
         limit.widthAnchor.constraint(equalToConstant: 320).isActive = true
@@ -141,15 +156,28 @@ extension EditorController {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         guard let kb = Double(limit.stringValue), kb.isFinite, kb >= 0, kb <= 200000 else { showError(DeskError.message("大小上限请输入 0～200000 KB。")); return }
         let maxBytes = kb == 0 ? nil : max(1, Int(kb * 1000))
+        guard ImageFormat.allCases.indices.contains(formatPicker.indexOfSelectedItem) else { return }
         let format = ImageFormat.allCases[formatPicker.indexOfSelectedItem]
-        let panel = NSSavePanel(); panel.allowedContentTypes = [UTType(filenameExtension: format.fileExtension) ?? .image]; panel.nameFieldStringValue = suggestedName + "." + format.fileExtension
+        let panel = makeFilePanel(ext: format.fileExtension, message: "导出图片副本不会改变工程或原图片。保存后可在底部点击“在 Finder 中显示”。")
+        panel.nameFieldStringValue = fileExperience.suggestedName(title: suggestedName, ext: format.fileExtension)
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        runTask("正在压缩并保存图片", work: { () throws -> ImageExportResult in
+        guard format.exportExtensions.contains(url.pathExtension.lowercased()) else {
+            showError(DeskError.message("文件名需要使用 .\(format.fileExtension) 扩展名。")); return
+        }
+        exportImageAsynchronously(image, format: format, maxBytes: maxBytes, to: url)
+    }
+
+    @discardableResult
+    func exportImageAsynchronously(_ image: CGImage, format: ImageFormat, maxBytes: Int?, to url: URL) -> Bool {
+        exportAsynchronously(to: url, kind: "\(format.title) 图片", work: { () throws -> ImageExportResult in
             let exported = try ImageTools.export(image, format: format, maxBytes: maxBytes)
             try exported.data.write(to: url, options: .atomic)
             return exported
         }, completion: { [weak self] output in
-            self?.statusLabel.stringValue = String(format: "已保存：%.1f KB · %d × %d 像素%@", Double(output.data.count) / 1000, output.width, output.height, output.resized ? " · 已降低像素尺寸" : "")
+            let size = String(format: "%.1f KB", Double(output.data.count) / 1000)
+            let limit = maxBytes.map { String(format: "（上限 %.1f KB）", Double($0) / 1000) } ?? ""
+            let details = "已导出 \(format.title)：\(size)\(limit) · \(output.width) × \(output.height) 像素\(output.resized ? " · 已降低像素尺寸" : "")"
+            self?.recordOutput(to: url, message: details)
         })
     }
 }
